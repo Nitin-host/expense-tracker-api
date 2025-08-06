@@ -104,11 +104,9 @@ const refreshAccessToken = async (req, res, next) => {
     if (!token) return res.status(401).json({ message: 'No refresh token provided' });
 
     try {
-        // Find the user who has this refresh token
         const user = await User.findOne({ 'refreshTokens.token': token });
         if (!user) return res.status(403).json({ message: 'Invalid refresh token' });
 
-        // Get token object
         const oldToken = user.refreshTokens.find(rt => rt.token === token);
         if (!oldToken || oldToken.expiresAt < new Date()) {
             return res.status(403).json({ message: 'Refresh token expired' });
@@ -117,24 +115,22 @@ const refreshAccessToken = async (req, res, next) => {
         // Remove old token
         user.refreshTokens = user.refreshTokens.filter(rt => rt.token !== token);
 
-        // Generate new tokens
         const newAccessToken = generateAccessToken(user);
         const newRefreshToken = generateRefreshToken();
 
-        // Save new refresh token
         user.refreshTokens.push({
             token: newRefreshToken,
-            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         });
 
         await user.save();
 
-        // Set new refresh token in cookie
         res.cookie('refreshToken', newRefreshToken, {
             httpOnly: true,
             secure: true,
+            secure: process.env.NODE_ENV === 'production',
             sameSite: 'Strict',
-            maxAge: 7 * 24 * 60 * 60 * 1000
+            maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
         res.json({ token: newAccessToken });
@@ -222,7 +218,7 @@ const createUserBySuperAdmin = async (req, res, next) => {
 
         await newUser.save();
 
-        const resetLink = `https://expense-tracker-nitins.vercel.app/change-password?email=${encodeURIComponent(email)}&temp=true`;
+        const resetLink = `https://expense-tracker-omega-eosin-23.vercel.app/change-password?email=${encodeURIComponent(email)}&temp=true`;
         const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
         let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
 
@@ -230,7 +226,7 @@ const createUserBySuperAdmin = async (req, res, next) => {
             .replace(/{{tempPassword}}/g, tempPassword)
             .replace(/{{resetLink}}/g, resetLink);
 
-        await sendEmail(email, 'Your Account Created - Vinayaka Chavithi Expense Tracker', htmlTemplate);
+        await sendEmail(email, 'Your Account Created - Expense Tracker', htmlTemplate);
         res.status(201).json({ message: 'User created and email sent.' });
     } catch (error) {
         next(error);
@@ -351,6 +347,39 @@ const getUsersForSharing = async (req, res, next) => {
     }
 };
 
+// Controller for super admin to delete users
+const deleteUserBySuperAdmin = async (req, res, next) => {
+    try {
+        // Ensure requester is super_admin
+        if (req.user.role !== 'super_admin') {
+            throw new ForbiddenError('Only super admins can delete users.');
+        }
+
+        // Get user ID to delete from params
+        const { userId } = req.params;
+
+        if (!userId) {
+            throw new BadRequestError('User ID is required.');
+        }
+
+        // Prevent self-deletion
+        if (req.user.userId === userId) {
+            throw new ForbiddenError('Super admins cannot delete themselves.');
+        }
+
+        const user = await User.findById(userId);
+        if (!user) throw new NotFoundError('User not found.');
+
+        await User.findByIdAndDelete(userId);
+
+        // (Optional) Clean up other related data here: e.g., user's tokens, content
+
+        res.json({ message: 'User deleted successfully.' });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
     createUser,
     login,
@@ -362,5 +391,6 @@ module.exports = {
     getCreatedUsers,
     changeUserRole,
     getAllUsers,
-    getUsersForSharing
+    getUsersForSharing,
+    deleteUserBySuperAdmin
 };

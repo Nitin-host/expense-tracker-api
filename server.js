@@ -25,7 +25,7 @@ app.use(helmet());
 // Enable CORS for specific origins (dev & prod)
 const allowedOrigins = [
     'http://localhost:5173', // For local dev
-    'https://expense-tracker-nitins.vercel.app', // For deployed app
+    'https://expense-tracker-omega-eosin-23.vercel.app', // For deployed app
 ];
 
 app.use(cors({
