@@ -25,7 +25,7 @@ router.get(
 );
 
 // Public route to refresh access token (refresh token flow)
-router.get('/refresh-token', asyncHandler(userController.refreshAccessToken));
+router.get('/refresh', asyncHandler(userController.refreshAccessToken));
 
 // Change password route - consider protecting with authentication middleware if appropriate
 // If you want to protect it, add authenticateToken middleware here
@@ -54,6 +54,7 @@ router.put(
 );
 
 
+router.delete('/user/:userId', authenticateToken, authorizeRole(['admin', 'super_admin']), userController.deleteUserBySuperAdmin);
 // Public forgot/request temp password (no auth required)
 router.post('/request-temp-password', asyncHandler(userController.requestTempPassword));
 
