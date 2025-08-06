@@ -14,7 +14,6 @@ const expenseRouter = require('./routers/ExpenseRouter');
 const dashboardRouter = require('./routers/DashboardRoutes');
 const cookieParser = require('cookie-parser');
 
-
 const app = express();
 app.use(cookieParser());
 
@@ -23,7 +22,7 @@ app.use(cookieParser());
 // Use helmet to set secure HTTP headers
 app.use(helmet());
 
-// Enable CORS for all origins (development - change to specific origins in production)
+// Enable CORS for specific origins (dev & prod)
 const allowedOrigins = [
     'http://localhost:5173', // For local dev
     'https://expense-tracker-nitins.vercel.app', // For deployed app
@@ -47,7 +46,7 @@ app.use('/api', apiLimiter);
 // --- Body Parser ---
 app.use(express.json()); // Parse JSON bodies
 
-// Connection with caching to avoid multiple connections in serverless environments
+// Connection caching to avoid multiple DB connections in serverless env
 let cached = global.mongoose;
 
 if (!cached) {
@@ -68,9 +67,10 @@ async function connectToDatabase() {
     cached.conn = await cached.promise;
     return cached.conn;
 }
+
 // --- Routes ---
 
-// Use routers for different API sections
+// Use routers for different API sections (make sure these files exist and export routers)
 app.use('/api', userRouter);
 app.use('/api/solution', solutionCardRouter);
 app.use('/api/expense', expenseRouter);
@@ -78,16 +78,11 @@ app.use('/api/collected-cash', collectedCashRoutes);
 app.use('/api', dashboardRouter);
 
 // --- Error Handling Middleware ---
-
 app.use(errorHandler);
 
-// --- Start Server ---
+// --- Start Server after DB connection ---
 
 const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
 
 connectToDatabase()
     .then(() => {
