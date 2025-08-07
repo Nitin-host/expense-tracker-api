@@ -12,7 +12,7 @@ const transporter = nodemailer.createTransport({
 
 const sendEmail = async (to, subject, html) => {
     const mailOptions = {
-        from: `"Vinayaka Chavithi Tracker" <${process.env.EMAIL_USER}>`,
+        from: `"Expense Tracker" <${process.env.EMAIL_USER}>`,
         to,
         subject,
         html,
