@@ -17,7 +17,7 @@ const userSchema = new mongoose.Schema({
     role: {
         type: String,
         enum: ['super_admin', 'admin', 'user'],
-        default: 'super_admin',
+        default: 'user',
     },
     password: { type: String, required: true },
     tempPasswordExpiresAt: { type: Date, default: null },
