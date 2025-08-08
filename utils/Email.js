@@ -22,4 +22,16 @@ const sendEmail = async (to, subject, html) => {
     await transporter.sendMail(mailOptions);
 };
 
-module.exports = { sendEmail };
+const forgotEmail = async (to, subject, html) => {
+    const mailOptions = {
+        from: `"Expense Tracker" <${process.env.EMAIL_USER}>`,
+        to,
+        subject,
+        html,
+        // You can add html here for a richer email template as well
+    };
+
+    await transporter.sendMail(mailOptions);
+}
+
+module.exports = { sendEmail, forgotEmail };

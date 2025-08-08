@@ -20,11 +20,14 @@ const userSchema = new mongoose.Schema({
         default: 'user',
     },
     password: { type: String, required: true },
-    tempPasswordExpiresAt: { type: Date, default: null },
     passwordChanged: { type: Boolean, default: false },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
-    refreshTokens: [refreshTokenSchema]
+    refreshTokens: [refreshTokenSchema],
+
+    // For forgot password OTP flow:
+    passwordResetOTP: { type: String, default: null },           // Store OTP code (hashed or plain text)
+    passwordResetOTPExpiresAt: { type: Date, default: null }     // Expiry of OTP
 }, { timestamps: true });
 
 module.exports = mongoose.model('User', userSchema);

@@ -19,84 +19,95 @@ router.get(
 
         const solutionObjectId = new mongoose.Types.ObjectId(solutionCardId);
 
-        // Aggregate total collected cash
-        const collectedCashAgg = await CollectedCash.aggregate([
-            { $match: { solutionCardId: solutionObjectId } },
-            {
-                $group: {
-                    _id: null,
-                    totalCollectedCash: { $sum: '$amount' },
+        // Run all queries in parallel
+        const [
+            collectedCashAgg,
+            expenseAgg,
+            expenseByCategoryAgg,
+            collectedCashByCategoryAgg,
+            recentExpenses,
+            recentCollectedCash,
+        ] = await Promise.all([
+            // total collected cash
+            CollectedCash.aggregate([
+                { $match: { solutionCardId: solutionObjectId } },
+                {
+                    $group: {
+                        _id: null,
+                        totalCollectedCash: { $sum: '$amount' },
+                    },
                 },
-            },
+            ]),
+
+            // total expenses
+            Expense.aggregate([
+                { $match: { solutionCard: solutionObjectId } },
+                {
+                    $group: {
+                        _id: null,
+                        totalExpenses: { $sum: '$amount' },
+                    },
+                },
+            ]),
+
+            // expense summary by category
+            Expense.aggregate([
+                { $match: { solutionCard: solutionObjectId } },
+                {
+                    $group: {
+                        _id: { $ifNull: ['$category', 'Uncategorized'] },
+                        amount: { $sum: '$amount' },
+                    },
+                },
+                {
+                    $project: {
+                        category: '$_id',
+                        amount: 1,
+                        _id: 0,
+                    },
+                },
+            ]),
+
+            // collected cash summary by name/category
+            CollectedCash.aggregate([
+                { $match: { solutionCardId: solutionObjectId } },
+                {
+                    $group: {
+                        _id: { $ifNull: ['$name', 'Uncategorized'] },
+                        amount: { $sum: '$amount' },
+                    },
+                },
+                {
+                    $project: {
+                        category: '$_id',
+                        amount: 1,
+                        _id: 0,
+                    },
+                },
+            ]),
+
+            // recent 5 expenses
+            Expense.find({ solutionCard: solutionObjectId })
+                .sort({ createdAt: -1 })
+                .limit(5)
+                .select('name amount createdAt category')
+                .lean(),
+
+            // recent 5 collected cash
+            CollectedCash.find({ solutionCardId: solutionObjectId })
+                .sort({ collectedDate: -1 })
+                .limit(5)
+                .select('amount name collectedDate')
+                .lean(),
         ]);
+
         const totalCollectedCash =
             collectedCashAgg.length > 0 ? collectedCashAgg[0].totalCollectedCash : 0;
-
-        // Aggregate total expenses
-        const expenseAgg = await Expense.aggregate([
-            { $match: { solutionCard: solutionObjectId } },
-            {
-                $group: {
-                    _id: null,
-                    totalExpenses: { $sum: '$amount' },
-                },
-            },
-        ]);
         const totalExpenses = expenseAgg.length > 0 ? expenseAgg[0].totalExpenses : 0;
 
         const remainingBudget = totalCollectedCash - totalExpenses;
         const percentageSpent =
             totalCollectedCash > 0 ? Math.round((totalExpenses / totalCollectedCash) * 100) : 0;
-
-        // Aggregate expense summary by category, replace null/undefined with 'Uncategorized'
-        const expenseByCategoryAgg = await Expense.aggregate([
-            { $match: { solutionCard: solutionObjectId } },
-            {
-                $group: {
-                    _id: { $ifNull: ['$category', 'Uncategorized'] },
-                    amount: { $sum: '$amount' },
-                },
-            },
-            {
-                $project: {
-                    category: '$_id',
-                    amount: 1,
-                    _id: 0,
-                },
-            },
-        ]);
-
-        // Aggregate collected cash summary by 'name' (payer/source), treat missing names as 'Uncategorized'
-        const collectedCashByCategoryAgg = await CollectedCash.aggregate([
-            { $match: { solutionCardId: solutionObjectId } },
-            {
-                $group: {
-                    _id: { $ifNull: ['$name', 'Uncategorized'] },
-                    amount: { $sum: '$amount' },
-                },
-            },
-            {
-                $project: {
-                    category: '$_id',
-                    amount: 1,
-                    _id: 0,
-                },
-            },
-        ]);
-
-        // Recent 5 expenses sorted descending (createdAt)
-        const recentExpenses = await Expense.find({ solutionCard: solutionObjectId })
-            .sort({ createdAt: -1 })
-            .limit(5)
-            .select('name amount createdAt category')
-            .lean();
-
-        // Recent 5 collected cash entries sorted descending (collectedDate)
-        const recentCollectedCash = await CollectedCash.find({ solutionCardId: solutionObjectId })
-            .sort({ collectedDate: -1 })
-            .limit(5)
-            .select('amount name collectedDate')
-            .lean();
 
         return res.json({
             solutionCardId,
@@ -107,11 +118,11 @@ router.get(
 
             expenseSummary: {
                 total: totalExpenses,
-                byCategory: expenseByCategoryAgg, // [{ category, amount }, ...]
+                byCategory: expenseByCategoryAgg,
             },
             collectedCashSummary: {
                 total: totalCollectedCash,
-                byCategory: collectedCashByCategoryAgg, // [{ category, amount }, ...]
+                byCategory: collectedCashByCategoryAgg,
             },
 
             recentExpenses: recentExpenses.map(({ _id, name, amount, createdAt, category }) => ({
