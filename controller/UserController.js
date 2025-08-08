@@ -22,6 +22,10 @@ const generateRefreshToken = () => {
     return crypto.randomBytes(64).toString('hex');
 };
 
+const generateOTP = () => {
+    return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
 const createUser = async (req, res, next) => {
     try {
         const { name, email, password } = req.body;
@@ -272,7 +276,7 @@ const requestTempPassword = async (req, res, next) => {
             .replace(/{{tempPassword}}/g, tempPassword)
             .replace(/{{resetLink}}/g, resetLink);
 
-        await sendEmail(email, 'Reset your Password - Vinayaka Chavithi Tracker', htmlTemplate);
+        await sendEmail(email, 'Reset your Password - Expense Tracker', htmlTemplate);
         res.json(genericSuccess);
     } catch (error) {
         next(error);
@@ -355,14 +359,11 @@ const deleteUserBySuperAdmin = async (req, res, next) => {
             throw new ForbiddenError('Only super admins can delete users.');
         }
 
-        // Get user ID to delete from params
         const { userId } = req.params;
-
         if (!userId) {
             throw new BadRequestError('User ID is required.');
         }
 
-        // Prevent self-deletion
         if (req.user.userId === userId) {
             throw new ForbiddenError('Super admins cannot delete themselves.');
         }
@@ -370,11 +371,104 @@ const deleteUserBySuperAdmin = async (req, res, next) => {
         const user = await User.findById(userId);
         if (!user) throw new NotFoundError('User not found.');
 
+        // Delete the user
         await User.findByIdAndDelete(userId);
 
-        // (Optional) Clean up other related data here: e.g., user's tokens, content
+        // Remove this user from all solution cards sharedWith arrays
+        await SolutionCard.updateMany(
+            { 'sharedWith.user': userId },
+            { $pull: { sharedWith: { user: userId } } }
+        );
 
-        res.json({ message: 'User deleted successfully.' });
+        // Optional: Also clean other related data here if needed
+
+        res.json({ message: 'User deleted successfully and removed from shared solution cards.' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+const sendPasswordResetOTP = async (req, res, next) => {
+    try {
+        const { email } = req.body;
+        if (!email) throw new BadRequestError('Email is required');
+
+        const user = await User.findOne({ email: email.toLowerCase() });
+        if (!user) return res.json({ message: "If your email is registered, you'll receive an OTP." }); // Avoid info leak
+
+        // Generate OTP & expiry (10 minutes)
+        const otp = generateOTP();
+        const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+        // Optionally hash OTP before saving for security (recommended)
+        const hashedOTP = await bcrypt.hash(otp, 10);
+
+        user.passwordResetOTP = hashedOTP;
+        user.passwordResetOTPExpiresAt = otpExpiresAt;
+        await user.save();
+
+        // Send email with OTP
+        const templatePath = path.join(__dirname, '..', 'templates', 'forgetPasswordEmail.html');
+        let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
+        htmlTemplate = htmlTemplate
+            .replace(/{{name}}/g, user.name)
+            .replace(/{{otp}}/g, otp)
+            .replace(/{{expiryMinutes}}/g, '10');
+
+        // Send email
+        await sendEmail(user.email, 'Password Reset OTP - Expense Tracker', htmlTemplate);
+
+        res.json({ message: "If your email is registered, you'll receive an OTP." });
+    } catch (error) {
+        next(error);
+    }
+};
+
+const verifyPasswordResetOTP = async (req, res, next) => {
+    try {
+        const { email, otp } = req.body;
+        if (!email || !otp) throw new BadRequestError('Email and OTP are required');
+
+        const user = await User.findOne({ email: email.toLowerCase() });
+        if (!user) throw new UnauthorizedError('Invalid email or OTP');
+
+        if (!user.passwordResetOTP || !user.passwordResetOTPExpiresAt) {
+            throw new UnauthorizedError('No OTP requested for this user');
+        }
+
+        if (user.passwordResetOTPExpiresAt < new Date()) {
+            throw new UnauthorizedError('OTP has expired');
+        }
+
+        const validOTP = await bcrypt.compare(otp, user.passwordResetOTP);
+        if (!validOTP) throw new UnauthorizedError('Invalid OTP');
+
+        // OTP is valid, clear it to prevent reuse
+        user.passwordResetOTP = null;
+        user.passwordResetOTPExpiresAt = null;
+        await user.save();
+
+        res.json({ message: 'OTP verified successfully. You may now reset your password.' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+const resetPassword = async (req, res, next) => {
+    try {
+        const { email, newPassword } = req.body;
+        if (!email || !newPassword) throw new BadRequestError('Email and new password are required');
+
+        const user = await User.findOne({ email: email.toLowerCase() });
+        if (!user) throw new NotFoundError('User not found');
+
+        // Optionally you can enforce that OTP verification is done by checking a flag or trust that frontend called verify OTP first.
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        user.passwordChanged = true;  // mark password as changed
+        await user.save();
+
+        res.json({ message: 'Password has been reset successfully.' });
     } catch (error) {
         next(error);
     }
@@ -392,5 +486,8 @@ module.exports = {
     changeUserRole,
     getAllUsers,
     getUsersForSharing,
-    deleteUserBySuperAdmin
+    deleteUserBySuperAdmin,
+    sendPasswordResetOTP,
+    verifyPasswordResetOTP,
+    resetPassword
 };

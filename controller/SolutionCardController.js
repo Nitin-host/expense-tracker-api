@@ -1,6 +1,7 @@
 const SolutionCard = require('../models/SolutionCard');
 const User = require('../models/User');
 const { BadRequestError, NotFoundError, ForbiddenError } = require('../utils/Errors');
+const { checkPermission } = require('../utils/checkPermission')
 
 // Helper: check if user has access, returns role or null
 const getUserRoleOnCard = (solutionCard, userId) => {
@@ -227,25 +228,27 @@ const deleteSolutionCard = async (req, res, next) => {
     try {
         const { id } = req.params;
         const userId = req.user.userId;
-        const userRole = req.user.role; // assuming this is set in your auth middleware
 
-        const card = await SolutionCard.findById(id);
-        if (!card || card.isDeleted) {
+        // Only allow owner, disallow editors/viewers here explicitly by setting allowedRoles empty
+        const { role, solutionCard } = await checkPermission({
+            resourceType: 'solution',
+            resourceId: id,
+            userId,
+            allowedRoles: [],  // no roles allowed except owner
+            allowOwner: true,
+        });
+
+        if (role !== 'owner') {
+            throw new ForbiddenError('Only the owner can delete this solution card');
+        }
+
+        if (solutionCard.isDeleted) {
             throw new NotFoundError('Solution card not found');
         }
 
-        // Allow deletion if:
-        // a) user is owner
-        // b) OR user role is 'admin' or 'super_admin'
-        const isOwner = card.owner.equals(userId);
-        if (!isOwner && !['admin', 'super_admin'].includes(userRole)) {
-            throw new ForbiddenError('Only owner, admin, or super_admin can delete this solution card');
-        }
-
-        card.isDeleted = true;
-        card.deletedAt = new Date();
-
-        await card.save();
+        solutionCard.isDeleted = true;
+        solutionCard.deletedAt = new Date();
+        await solutionCard.save();
 
         res.json({ message: 'Solution card deleted (soft delete) successfully' });
     } catch (error) {

@@ -1,20 +1,9 @@
+// controllers/expenseController.js
 const Expense = require('../models/Expense');
-const SolutionCard = require('../models/SolutionCard');
 const cloudinary = require('../utils/Cloudinary');
 const fs = require('fs');
-const { BadRequestError, NotFoundError, ForbiddenError } = require('../utils/Errors');
-
-const getExpenseById = async (id) => {
-    return await Expense.findById(id);
-};
-
-// Helper to get user role on solution card
-const getUserRoleOnCard = (solutionCard, userId) => {
-    if (solutionCard.owner.equals(userId)) return 'owner';
-    const sharedUser = solutionCard.sharedWith.find(s => s.user.equals(userId));
-    if (!sharedUser) return null;
-    return sharedUser.role;
-};
+const { BadRequestError, NotFoundError } = require('../utils/Errors');
+const { checkPermission } = require('../utils/checkPermission');
 
 // Helper: uploads multiple screenshots, returns arrays of URLs and public IDs
 async function uploadUPIScreenshots(files) {
@@ -32,7 +21,7 @@ async function uploadUPIScreenshots(files) {
     return { urls, publicIds };
 }
 
-// Create new expense with initial payment (supports multiple screenshots)
+// Create new expense
 const createExpense = async (req, res, next) => {
     try {
         const userId = req.user.userId;
@@ -44,15 +33,16 @@ const createExpense = async (req, res, next) => {
         if (+paidAmount > +amount) {
             throw new BadRequestError('Paid amount cannot be greater than total amount.');
         }
-        const solutionCard = await SolutionCard.findById(solutionCardId);
-        if (!solutionCard) throw new NotFoundError('Solution card not found.');
 
-        const role = getUserRoleOnCard(solutionCard, userId);
-        if (!role || (role !== 'owner' && role !== 'editor')) {
-            throw new ForbiddenError('You do not have permission to add expenses to this solution card.');
-        }
+        // Permission check (owner/editor)
+        const { role: accessLevel } = await checkPermission({
+            resourceType: 'solution',
+            resourceId: solutionCardId,
+            userId,
+            allowedRoles: ['editor'], // viewer is excluded
+            allowOwner: true
+        });
 
-        // UPI screenshots (multiple)
         let upiScreenshotData = {};
         if (paymentMethod === 'upi') {
             if (!req.files || req.files.length === 0) {
@@ -81,9 +71,8 @@ const createExpense = async (req, res, next) => {
         });
 
         await newExpense.save();
-        res.status(201).json({ message: 'Expense created successfully.', expense: newExpense });
+        res.status(201).json({ message: 'Expense created successfully.', expense: newExpense, accessLevel });
     } catch (error) {
-        // Cleanup local temp files
         if (req.files && req.files.length) {
             req.files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
         }
@@ -91,7 +80,7 @@ const createExpense = async (req, res, next) => {
     }
 };
 
-// Add further payment to existing expense (supports multiple screenshots)
+// Add further payment to existing expense
 const addPayment = async (req, res, next) => {
     try {
         const userId = req.user.userId;
@@ -101,16 +90,14 @@ const addPayment = async (req, res, next) => {
         if (!paidAmount || !paymentMethod) {
             throw new BadRequestError('paidAmount and paymentMethod are required.');
         }
-        const expense = await Expense.findById(expenseId);
-        if (!expense) throw new NotFoundError('Expense not found.');
 
-        const solutionCard = await SolutionCard.findById(expense.solutionCard);
-        if (!solutionCard) throw new NotFoundError('Linked solution card not found.');
-
-        const role = getUserRoleOnCard(solutionCard, userId);
-        if (!role || (role !== 'owner' && role !== 'editor')) {
-            throw new ForbiddenError('You do not have permission to add payments to this expense.');
-        }
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: expenseId,
+            userId,
+            allowedRoles: ['editor'],
+            allowOwner: true
+        });
 
         if (+paidAmount > expense.amount - expense.advancePaid) {
             throw new BadRequestError('Paid amount exceeds pending amount.');
@@ -136,7 +123,7 @@ const addPayment = async (req, res, next) => {
 
         expense.payments.push(paymentObj);
         await expense.save();
-        res.json({ message: 'Payment added successfully.', expense });
+        res.json({ message: 'Payment added successfully.', expense, accessLevel });
     } catch (error) {
         if (req.files && req.files.length) {
             req.files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
@@ -145,43 +132,51 @@ const addPayment = async (req, res, next) => {
     }
 };
 
-// Retrieve all expenses by solution card (with permission check)
+// Retrieve expenses by solution card
 const getExpensesBySolutionCard = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { solutionCardId } = req.params;
-        const solutionCard = await SolutionCard.findById(solutionCardId);
-        if (!solutionCard) throw new NotFoundError('Solution card not found.');
 
-        const role = getUserRoleOnCard(solutionCard, userId);
-        if (!role) throw new ForbiddenError('Access denied to this solution card.');
+        const { role: accessLevel } = await checkPermission({
+            resourceType: 'solution',
+            resourceId: solutionCardId,
+            userId,
+            allowedRoles: ['viewer', 'editor'],
+            allowOwner: true
+        });
 
         const expenses = await Expense.find({ solutionCard: solutionCardId })
             .populate('paidBy', 'name email')
             .sort({ createdAt: -1 });
 
-        res.json({ expenses });
+        res.json({ expenses, accessLevel });
     } catch (error) {
         next(error);
     }
 };
 
-// Update expense fields (not payments) - only owner/editor
+// Update expense
 const updateExpense = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { id } = req.params;
 
-        // Extract fields from req.body (all as strings, multipart form)
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: id,
+            userId,
+            allowedRoles: ['editor'],
+            allowOwner: true
+        });
+
         const { name, category, amount, payments, existingScreenshots } = req.body;
 
-        // Parse complex JSON fields safely
         let parsedPayments = [];
         if (payments) {
             try {
                 parsedPayments = JSON.parse(payments);
-            } catch (e) {
-                // If parsing fails, ignore or handle error
+            } catch {
                 return res.status(400).json({ message: 'Invalid payments JSON format' });
             }
         }
@@ -190,23 +185,11 @@ const updateExpense = async (req, res, next) => {
         if (existingScreenshots) {
             try {
                 parsedExistingScreenshots = JSON.parse(existingScreenshots);
-            } catch (e) {
+            } catch {
                 return res.status(400).json({ message: 'Invalid existingScreenshots JSON format' });
             }
         }
 
-        const expense = await Expense.findById(id);
-        if (!expense) throw new NotFoundError('Expense not found.');
-
-        const solutionCard = await SolutionCard.findById(expense.solutionCard);
-        if (!solutionCard) throw new NotFoundError('Linked solution card not found.');
-
-        const role = getUserRoleOnCard(solutionCard, userId);
-        if (!role || (role !== 'owner' && role !== 'editor')) {
-            throw new ForbiddenError('You do not have permission to update this expense.');
-        }
-
-        // Update basic fields
         if (name !== undefined) expense.name = name;
         if (category !== undefined) expense.category = category;
 
@@ -218,10 +201,7 @@ const updateExpense = async (req, res, next) => {
             expense.amount = numericAmount;
         }
 
-        // Update payments if data provided
         if (parsedPayments.length > 0) {
-            // For each payment, integrate existingScreenshots if applicable
-            // Assuming the first payment corresponds to screenshots passed
             parsedPayments.forEach(payment => {
                 if (payment.paymentMethod === 'upi') {
                     payment.upiScreenshotUrls = parsedExistingScreenshots;
@@ -229,18 +209,12 @@ const updateExpense = async (req, res, next) => {
             });
             expense.payments = parsedPayments;
         } else if (parsedExistingScreenshots.length > 0 && expense.payments.length > 0) {
-            // If no new payments but existing screenshots updated, update screenshots in first payment
             expense.payments[0].upiScreenshotUrls = parsedExistingScreenshots;
         }
 
-        // Process new uploaded files
         if (req.files && req.files.length > 0) {
-            // You should save/move files properly and generate URLs
-            // Example: temporary URLs from uploaded files
             const newScreenshotUrls = req.files.map(file => `/uploads/${file.filename}`);
-
             if (expense.payments.length > 0) {
-                // Append new screenshots to first payment (adjust if needed)
                 expense.payments[0].upiScreenshotUrls = [
                     ...(expense.payments[0].upiScreenshotUrls || []),
                     ...newScreenshotUrls,
@@ -249,30 +223,28 @@ const updateExpense = async (req, res, next) => {
         }
 
         await expense.save();
-        res.json({ message: 'Expense updated successfully.', expense });
+        res.json({ message: 'Expense updated successfully.', expense, accessLevel });
     } catch (error) {
         next(error);
     }
 };
 
-// Delete expense and all UPI screenshots (Cloudinary)
+// Delete expense
 const deleteExpense = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { id } = req.params;
 
-        const expense = await Expense.findById(id);
-        if (!expense) throw new NotFoundError('Expense not found.');
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: id,
+            userId,
+            allowedRoles: ['editor'],
+            allowOwner: true
+        });
 
-        const solutionCard = await SolutionCard.findById(expense.solutionCard);
-        if (!solutionCard) throw new NotFoundError('Linked solution card not found.');
-
-        const role = getUserRoleOnCard(solutionCard, userId);
-        if (!role && !expense.paidBy.equals(userId)) {
-            throw new ForbiddenError('You do not have permission to delete this expense.');
-        }
-        if (role !== 'owner' && role !== 'editor' && !expense.paidBy.equals(userId)) {
-            throw new ForbiddenError('You do not have permission to delete this expense.');
+        if (accessLevel !== 'owner' && accessLevel !== 'editor' && !expense.paidBy.equals(userId)) {
+            throw new BadRequestError('You do not have permission to delete this expense.');
         }
 
         for (const payment of expense.payments) {
@@ -282,32 +254,31 @@ const deleteExpense = async (req, res, next) => {
                 }
             }
         }
+
         expense.isDeleted = true;
         await expense.deleteOne();
-        res.json({ message: 'Expense deleted successfully.' });
+        res.json({ message: 'Expense deleted successfully.', accessLevel });
     } catch (error) {
         next(error);
     }
 };
 
+// Restore expense
 const restoreExpense = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { id } = req.params;
 
-        const expense = await Expense.findById(id);
-        if (!expense) {
-            throw new NotFoundError('Expense not found.');
-        }
+        const { resource: expense, solutionCard, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: id,
+            userId,
+            allowedRoles: [],
+            allowOwner: true
+        });
 
-        const solutionCard = await SolutionCard.findById(expense.solutionCard);
-        if (!solutionCard) {
-            throw new NotFoundError('Linked solution card not found.');
-        }
-
-        // Only the owner can restore soft-deleted expense
         if (!solutionCard.owner.equals(userId)) {
-            throw new ForbiddenError('Only owner can restore this expense.');
+            throw new BadRequestError('Only owner can restore this expense.');
         }
 
         if (!expense.isDeleted) {
@@ -316,40 +287,40 @@ const restoreExpense = async (req, res, next) => {
 
         expense.isDeleted = false;
         await expense.save();
-
-        res.json({ message: 'Expense restored successfully.', expense });
+        res.json({ message: 'Expense restored successfully.', expense, accessLevel });
     } catch (error) {
         next(error);
     }
 };
 
+// Get deleted expenses by solution card
 const getDeletedExpensesBySolutionCard = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { solutionCardId } = req.params;
 
-        const solutionCard = await SolutionCard.findById(solutionCardId);
-        if (!solutionCard) {
-            throw new NotFoundError('Solution card not found.');
-        }
+        const { solutionCard, role: accessLevel } = await checkPermission({
+            resourceType: 'solution',
+            resourceId: solutionCardId,
+            userId,
+            allowedRoles: [],
+            allowOwner: true
+        });
 
-        // Only owner can view deleted expenses
         if (!solutionCard.owner.equals(userId)) {
-            throw new ForbiddenError('Only owner can view deleted expenses.');
+            throw new BadRequestError('Only owner can view deleted expenses.');
         }
 
-        // Find expenses that are soft deleted for this solution card
         const deletedExpenses = await Expense.find({
             solutionCard: solutionCardId,
             isDeleted: true
         }).sort({ createdAt: -1 });
 
-        res.json({ deletedExpenses });
+        res.json({ deletedExpenses, accessLevel });
     } catch (error) {
         next(error);
     }
 };
-
 
 module.exports = {
     createExpense,
@@ -358,6 +329,5 @@ module.exports = {
     updateExpense,
     deleteExpense,
     restoreExpense,
-    getDeletedExpensesBySolutionCard,
-    getExpenseById
+    getDeletedExpensesBySolutionCard
 };

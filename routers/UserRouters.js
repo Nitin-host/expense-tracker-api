@@ -25,11 +25,15 @@ router.get(
 );
 
 // Public route to refresh access token (refresh token flow)
-router.get('/refresh', asyncHandler(userController.refreshAccessToken));
+router.post('/refresh', asyncHandler(userController.refreshAccessToken));
 
 // Change password route - consider protecting with authentication middleware if appropriate
 // If you want to protect it, add authenticateToken middleware here
 router.post('/change-password', asyncHandler(userController.changePassword));
+
+router.post('/forgot-password/send-otp', asyncHandler(userController.sendPasswordResetOTP));
+router.post('/forgot-password/verify-otp', asyncHandler(userController.verifyPasswordResetOTP));
+router.post('/forgot-password/reset', asyncHandler(userController.resetPassword))
 
 // Protected route - only super_admin and admin can create users for others
 router.post(
