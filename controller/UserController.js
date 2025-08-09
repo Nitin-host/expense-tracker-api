@@ -221,8 +221,8 @@ const createUserBySuperAdmin = async (req, res, next) => {
         });
 
         await newUser.save();
-
-        const resetLink = `https://expense-tracker-omega-eosin-23.vercel.app/change-password?email=${encodeURIComponent(email)}&temp=true`;
+        
+        const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
         const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
         let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
 
@@ -267,8 +267,8 @@ const requestTempPassword = async (req, res, next) => {
         user.tempPasswordExpiresAt = tempPasswordExpiresAt;
         user.passwordChanged = false;
         await user.save();
-
-        const resetLink = `https://your-frontend-url.com/change-password?email=${encodeURIComponent(email)}&temp=true`;
+        
+        const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
         const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
         let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
 
