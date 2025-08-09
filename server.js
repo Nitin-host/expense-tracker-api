@@ -18,38 +18,52 @@ const app = express();
 app.use(cookieParser());
 
 // --- Security Middlewares ---
+app.use(
+    helmet({
+        crossOriginResourcePolicy: false, // needed for React static assets
+    })
+);
 
-// Use helmet to set secure HTTP headers
-app.use(helmet());
-
-// Enable CORS for specific origins (dev & prod)
+// --- CORS Setup ---
 const allowedOrigins = [
-    'http://localhost:5173', // For local dev
-    'https://expense-tracker-omega-eosin-23.vercel.app', // For deployed app
-    'https://expense-tracker-vija-apps.netlify.app'
+    'http://localhost:5173', // Local dev
+    'https://expense-tracker-vija-apps.netlify.app', // Netlify frontend
 ];
 
-app.use(cors({
-    origin: allowedOrigins,
-    credentials: true,
-}));
+app.use(
+    cors({
+        origin: function (origin, callback) {
+            if (!origin) return callback(null, true); // Allow non-browser requests
+            if (allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            } else {
+                return callback(new Error('Not allowed by CORS'));
+            }
+        },
+        credentials: true,
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
+    })
+);
+
+// Handle preflight requests
+app.options('*', cors());
 
 // --- Rate Limiting ---
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes window
-    max: 100,                 // limit each IP to 100 requests per window
-    standardHeaders: true,    // Return rate limit info in the `RateLimit-*` headers
-    legacyHeaders: false,     // Disable the `X-RateLimit-*` headers
+    max: 100, // limit each IP to 100 requests
+    standardHeaders: true,
+    legacyHeaders: false,
     message: 'Too many requests from this IP, please try again after 15 minutes',
 });
 app.use('/api', apiLimiter);
 
 // --- Body Parser ---
-app.use(express.json()); // Parse JSON bodies
+app.use(express.json());
 
-// Connection caching to avoid multiple DB connections in serverless env
+// --- MongoDB Connection Caching ---
 let cached = global.mongoose;
-
 if (!cached) {
     cached = global.mongoose = { conn: null, promise: null };
 }
@@ -60,18 +74,18 @@ async function connectToDatabase() {
     }
 
     if (!cached.promise) {
-        cached.promise = mongoose.connect(process.env.MONGO_URI, {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-        }).then(mongoose => mongoose);
+        cached.promise = mongoose
+            .connect(process.env.MONGO_URI, {
+                useNewUrlParser: true,
+                useUnifiedTopology: true,
+            })
+            .then((mongoose) => mongoose);
     }
     cached.conn = await cached.promise;
     return cached.conn;
 }
 
 // --- Routes ---
-
-// Use routers for different API sections (make sure these files exist and export routers)
 app.use('/api', userRouter);
 app.use('/api/solution', solutionCardRouter);
 app.use('/api/expense', expenseRouter);
@@ -81,8 +95,7 @@ app.use('/api', dashboardRouter);
 // --- Error Handling Middleware ---
 app.use(errorHandler);
 
-// --- Start Server after DB connection ---
-
+// --- Start Server ---
 const PORT = process.env.PORT || 5000;
 
 connectToDatabase()
