@@ -26,6 +26,7 @@ app.use(helmet());
 const allowedOrigins = [
     'http://localhost:5173', // For local dev
     'https://expense-tracker-omega-eosin-23.vercel.app', // For deployed app
+    'https://expense-tracker-vija-apps.netlify.app
 ];
 
 app.use(cors({
