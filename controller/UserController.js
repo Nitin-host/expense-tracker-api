@@ -14,7 +14,7 @@ const generateAccessToken = (user) => {
     return jwt.sign(
         { userId: user._id, role: user.role },
         process.env.JWT_SECRET,
-        { expiresIn: '15m' }
+        { expiresIn: '7d' }
     );
 };
 
@@ -50,6 +50,59 @@ const createUser = async (req, res, next) => {
     }
 };
 
+// const login = async (req, res, next) => {
+//     try {
+//         const { email, password } = req.body;
+
+//         if (!email || !password) {
+//             return res.status(400).json({ message: 'Email and password are required' });
+//         }
+
+//         const user = await User.findOne({ email: email.toLowerCase() });
+//         if (!user) return res.status(400).json({ message: 'Invalid credentials' });
+
+//         const isMatch = await bcrypt.compare(password, user.password);
+//         if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+//         const accessToken = generateAccessToken(user);
+
+//         // Check for existing unexpired refresh token
+//         const existingToken = user.refreshTokens.find(rt => rt.expiresAt > new Date());
+
+//         let refreshToken;
+//         if (existingToken) {
+//             refreshToken = existingToken.token;
+//         } else {
+//             refreshToken = generateRefreshToken();
+//             user.refreshTokens.push({
+//                 token: refreshToken,
+//                 expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+//             });
+//             await user.save();
+//         }
+
+//         res.cookie('refreshToken', refreshToken, {
+//             httpOnly: true,
+//             secure: true,
+//             sameSite: 'Strict',
+//             maxAge: 7 * 24 * 60 * 60 * 1000,
+//         });
+
+//         res.json({
+//             message: 'Login successful',
+//             token: accessToken,
+//             user: {
+//                 id: user._id,
+//                 name: user.name,
+//                 email: user.email,
+//                 role: user.role
+//             }
+//         });
+//     } catch (err) {
+//         next(err);
+//     }
+// };
+
 const login = async (req, res, next) => {
     try {
         const { email, password } = req.body;
@@ -65,28 +118,6 @@ const login = async (req, res, next) => {
         if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
         const accessToken = generateAccessToken(user);
-
-        // Check for existing unexpired refresh token
-        const existingToken = user.refreshTokens.find(rt => rt.expiresAt > new Date());
-
-        let refreshToken;
-        if (existingToken) {
-            refreshToken = existingToken.token;
-        } else {
-            refreshToken = generateRefreshToken();
-            user.refreshTokens.push({
-                token: refreshToken,
-                expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
-            });
-            await user.save();
-        }
-
-        res.cookie('refreshToken', refreshToken, {
-            httpOnly: true,
-            secure: true,
-            sameSite: 'Strict',
-            maxAge: 7 * 24 * 60 * 60 * 1000,
-        });
 
         res.json({
             message: 'Login successful',
@@ -221,7 +252,7 @@ const createUserBySuperAdmin = async (req, res, next) => {
         });
 
         await newUser.save();
-        
+
         const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
         const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
         let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
@@ -267,7 +298,7 @@ const requestTempPassword = async (req, res, next) => {
         user.tempPasswordExpiresAt = tempPasswordExpiresAt;
         user.passwordChanged = false;
         await user.save();
-        
+
         const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
         const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
         let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
