@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Solution Shared with You - Expense Tracker</title>
+    <style>
+        .container {
+            max-width: 500px;
+            margin: 30px auto;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f7fafc;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.09);
+            color: #212121;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        .header h2 {
+            color: #094fa3;
+        }
+
+        .content {
+            margin-bottom: 20px;
+            font-size: 1.1em;
+        }
+
+        .highlight-box {
+            background: #eaf2fe;
+            border-left: 4px solid #094fa3;
+            font-weight: bold;
+            padding: 16px;
+            font-size: 1.1em;
+            margin: 18px 0;
+            text-align: center;
+        }
+
+        .button {
+            display: inline-block;
+            padding: 12px 28px;
+            background: #094fa3;
+            color: #fff !important;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 1.15em;
+            margin: 20px auto;
+        }
+
+        .footer {
+            margin-top: 28px;
+            color: #5f6992;
+            font-size: 0.97em;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h2>Expense Tracker</h2>
+            <p>Solution Shared with You</p>
+        </div>
+        <div class="content">
+            Hi <b>{{name}}</b>,<br /><br />
+            <b>{{ownerName}}</b> has shared the solution <b>{{solutionName}}</b> with you as a <b>{{role}}</b>.
+        </div>
+        <div class="highlight-box">
+            You can now access and collaborate on this solution.
+        </div>
+        <div class="content" style="text-align:center;">
+            <a href="{{solutionLink}}" class="button">View "{{solutionName}}"</a>
+        </div>
+        <div class="content">
+            If you were not expecting this, you can safely ignore this email.<br /><br />
+            This link will take you directly to the shared solution.
+        </div>
+        <div class="footer">
+            &mdash; The Expense Tracker Team<br />
+            &copy; {{year}} Expense Tracker
+        </div>
+    </div>
+</body>
+
+</html>
