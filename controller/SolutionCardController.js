@@ -1,7 +1,11 @@
 const SolutionCard = require('../models/SolutionCard');
+const path = require('path');
+const fs = require('fs');
 const User = require('../models/User');
 const { BadRequestError, NotFoundError, ForbiddenError } = require('../utils/Errors');
-const { checkPermission } = require('../utils/checkPermission')
+const { checkPermission } = require('../utils/checkPermission');
+const { sendEmail } = require('../utils/Email');
+require('dotenv').config();
 
 // Helper: check if user has access, returns role or null
 const getUserRoleOnCard = (solutionCard, userId) => {
@@ -177,22 +181,23 @@ const updateSolutionCard = async (req, res, next) => {
 const shareSolutionCard = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { sharedWith, notifyUsers } = req.body; // sharedWith: [{ user, role}], e.g. from ShareSolutionModal
+        const { sharedWith, notifyUsers } = req.body;
         const userId = req.user.userId;
 
         const card = await SolutionCard.findById(id);
         if (!card || card.isDeleted)
             throw new NotFoundError('Solution card not found');
 
-        // Only owner can change sharing
         if (!card.owner.equals(userId)) {
             throw new ForbiddenError('Only owner can update this solution card sharing');
         }
 
-        // Validate and enrich sharedWith (name/email/role)
         if (!Array.isArray(sharedWith)) {
             throw new BadRequestError('sharedWith must be an array');
         }
+
+        const oldSharedUserIds = (card.sharedWith || []).map(u => u.user.toString());
+
         const enriched = [];
         for (const item of sharedWith) {
             if (!item.user || !item.role) {
@@ -211,13 +216,39 @@ const shareSolutionCard = async (req, res, next) => {
             });
         }
 
-        // Save the new sharedWith list
         card.sharedWith = enriched;
         await card.save();
 
-        // Optional: send notifications to new users if notifyUsers == true
+        if (notifyUsers) {
+            const owner = await User.findById(userId).select('name');
+            const newUsers = enriched.filter(u => !oldSharedUserIds.includes(u.user.toString()));
 
-        res.json({ message: 'Solution sharing updated successfully', sharedWith: card.sharedWith });
+            if (newUsers.length > 0) {
+                const templatePath = path.join(__dirname, '..', 'templates', 'solutionShared.html');
+                const templateSource = fs.readFileSync(templatePath, 'utf8');
+
+                await Promise.all(newUsers.map(async (user) => {
+                    const htmlContent = templateSource
+                        .replace(/{{name}}/g, user.name.trim())
+                        .replace(/{{ownerName}}/g, owner.name.trim())
+                        .replace(/{{role}}/g, user.role.trim())
+                        .replace(/{{solutionName}}/g, card.name || 'Untitled Solution')
+                        .replace(/{{solutionLink}}/g, `${process.env.FRONTEND_BASE_URL}/solutions`)
+                        .replace(/{{year}}/g, new Date().getFullYear());
+
+                    await sendEmail(
+                        user.email,
+                        `Solution "${card.name}" Shared with You`,
+                        htmlContent
+                    );
+                }));
+            }
+        }
+
+        res.json({
+            message: 'Solution sharing updated successfully',
+            sharedWith: card.sharedWith
+        });
     } catch (error) {
         next(error);
     }
