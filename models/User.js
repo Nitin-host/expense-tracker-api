@@ -21,6 +21,7 @@ const userSchema = new mongoose.Schema({
     },
     password: { type: String, required: true },
     passwordChanged: { type: Boolean, default: false },
+    tempPasswordExpiresAt: { type: Date, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
     refreshTokens: [refreshTokenSchema],
