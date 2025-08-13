@@ -200,29 +200,39 @@ const logout = async (req, res, next) => {
 const changePassword = async (req, res, next) => {
     try {
         const { email, oldPassword, newPassword } = req.body;
+
         if (!email || !oldPassword || !newPassword) {
-            throw new BadRequestError('Email, old password and new password are required.');
+            throw new BadRequestError('Email, old password, and new password are required');
         }
 
-        const user = await User.findOne({ email: email.toLowerCase() });
-        if (!user) throw new NotFoundError('User not found.');
+        const user = await User.findOne({ email: email.toLowerCase() }).select('+password +tempPasswordExpiresAt');
+        if (!user) {
+            throw new BadRequestError('User not found');
+        }
 
-        const isMatch = await bcrypt.compare(oldPassword, user.password);
-        if (!isMatch) throw new UnauthorizedError('Old password is incorrect.');
-
-        if (!user.passwordChanged) {
-            const now = new Date();
-            if (!user.tempPasswordExpiresAt || user.tempPasswordExpiresAt < now) {
+        // Check temp password expiry
+        if (user.tempPasswordExpiresAt) {
+            if (new Date() > user.tempPasswordExpiresAt) {
                 throw new ForbiddenError('Temporary password expired. Please request a new password reset.');
             }
+        } else {
+            throw new ForbiddenError('Temporary password not set.');
         }
 
+        // Check if old password matches temp password
+        const isMatch = await bcrypt.compare(oldPassword, user.password);
+        if (!isMatch) {
+            throw new ForbiddenError('Temporary password is incorrect');
+        }
+
+        // Update password
         user.password = await bcrypt.hash(newPassword, 10);
         user.passwordChanged = true;
         user.tempPasswordExpiresAt = null;
         await user.save();
 
-        res.json({ message: 'Password changed successfully.' });
+        res.json({ message: 'Password updated successfully' });
+
     } catch (error) {
         next(error);
     }
