@@ -195,11 +195,34 @@ const updateExpense = async (req, res, next) => {
 
         if (amount !== undefined) {
             const numericAmount = Number(amount);
-            if (numericAmount < expense.advancePaid) {
-                throw new BadRequestError('New amount cannot be less than total paid.');
+            let newAdvancePaid = expense.advancePaid;
+            if (parsedPayments.length > 0) {
+                newAdvancePaid = parsedPayments.reduce(
+                    (sum, p) => sum + Number(p.paidAmount || 0),
+                    0
+                );
             }
+            if (newAdvancePaid > numericAmount) {
+                throw new BadRequestError('Paid amount cannot be greater than total amount.');
+            }
+
             expense.amount = numericAmount;
+            expense.advancePaid = newAdvancePaid;
+        } else {
+            if (parsedPayments.length > 0) {
+                const newAdvancePaid = parsedPayments.reduce(
+                    (sum, p) => sum + Number(p.paidAmount || 0),
+                    0
+                );
+
+                if (newAdvancePaid > expense.amount) {
+                    throw new BadRequestError('Paid amount cannot be greater than total amount.');
+                }
+
+                expense.advancePaid = newAdvancePaid;
+            }
         }
+
 
         if (parsedPayments.length > 0) {
             parsedPayments.forEach(payment => {
