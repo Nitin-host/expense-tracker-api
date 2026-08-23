@@ -1,28 +1,26 @@
-// controllers/collectController.js
 const CollectedCash = require('../models/CollectedCash');
 const { checkPermission } = require('../utils/checkPermission');
+const { parsePagination, buildPaginatedResponse } = require('../utils/pagination');
 
-// Create Collected Cash (Owner + Editor only)
 exports.createCollectedCash = async (req, res, next) => {
     try {
         const { solutionCardId, name, amount } = req.body;
         const userId = req.user.userId;
 
         if (!solutionCardId || !name || !amount) {
-            return res.status(400).json({ message: 'solutionCardId, name, and amount are required.' });
+            return res.status(400).json({
+                success: false,
+                error: { code: 'BAD_REQUEST', message: 'solutionCardId, name, and amount are required.' },
+            });
         }
 
-        // Permission check: create => Owner + Editor
         const { role: accessLevel } = await checkPermission({
             resourceType: 'solution',
             resourceId: solutionCardId,
             userId,
-            allowedRoles: ['editor'], // viewer is excluded
-            allowOwner: true
+            allowedRoles: ['editor'],
+            allowOwner: true,
         });
-
-        // You can optionally set req.accessLevel if needed
-        req.accessLevel = accessLevel;
 
         const collectedCash = await CollectedCash.create({
             solutionCardId,
@@ -37,49 +35,61 @@ exports.createCollectedCash = async (req, res, next) => {
     }
 };
 
-// Get Collected Cash by Solution (Owner + Editor + Viewer)
 exports.getCollectedCashBySolution = async (req, res, next) => {
     try {
         const { solutionCardId } = req.params;
         const userId = req.user.userId;
+        const { q, from, to } = req.query;
+        const { page, limit, skip } = parsePagination(req.query);
 
-        // Permission check: view => all roles
         const { role: accessLevel } = await checkPermission({
             resourceType: 'solution',
             resourceId: solutionCardId,
             userId,
             allowedRoles: ['editor', 'viewer'],
-            allowOwner: true
+            allowOwner: true,
         });
 
-        req.accessLevel = accessLevel;
+        const filter = { solutionCardId };
+        if (q) filter.name = { $regex: q, $options: 'i' };
+        if (from || to) {
+            filter.collectedDate = {};
+            if (from) filter.collectedDate.$gte = new Date(from);
+            if (to) filter.collectedDate.$lte = new Date(to);
+        }
 
-        const collectedCash = await CollectedCash.find({ solutionCardId })
-            .sort({ collectedDate: -1 });
+        const [total, collectedCash] = await Promise.all([
+            CollectedCash.countDocuments(filter),
+            CollectedCash.find(filter).sort({ collectedDate: -1 }).skip(skip).limit(limit),
+        ]);
 
-        res.json({ collectedCash, accessLevel });
+        res.json(
+            buildPaginatedResponse({
+                data: collectedCash,
+                page,
+                limit,
+                total,
+                extra: { collectedCash, accessLevel },
+            })
+        );
     } catch (error) {
         next(error);
     }
 };
 
-// Update Collected Cash (Owner + Editor only)
 exports.updateCollectedCash = async (req, res, next) => {
     try {
         const { id } = req.params;
         const { name, amount } = req.body;
         const userId = req.user.userId;
 
-        // Permission check on the collected cash itself
         const { role: accessLevel } = await checkPermission({
             resourceType: 'collectedCash',
             resourceId: id,
             userId,
             allowedRoles: ['editor'],
-            allowOwner: true
+            allowOwner: true,
         });
-
-        req.accessLevel = accessLevel;
 
         const updated = await CollectedCash.findByIdAndUpdate(
             id,
@@ -87,7 +97,12 @@ exports.updateCollectedCash = async (req, res, next) => {
             { new: true }
         );
 
-        if (!updated) return res.status(404).json({ message: 'Collected cash entry not found.' });
+        if (!updated) {
+            return res.status(404).json({
+                success: false,
+                error: { code: 'NOT_FOUND', message: 'Collected cash entry not found.' },
+            });
+        }
 
         res.json({ message: 'Collected cash updated.', collectedCash: updated, accessLevel });
     } catch (error) {
@@ -95,25 +110,26 @@ exports.updateCollectedCash = async (req, res, next) => {
     }
 };
 
-// Delete Collected Cash (Owner + Editor only)
 exports.deleteCollectedCash = async (req, res, next) => {
     try {
         const { id } = req.params;
         const userId = req.user.userId;
 
-        // Permission check
         const { role: accessLevel } = await checkPermission({
             resourceType: 'collectedCash',
             resourceId: id,
             userId,
             allowedRoles: ['editor'],
-            allowOwner: true
+            allowOwner: true,
         });
 
-        req.accessLevel = accessLevel;
-
         const deleted = await CollectedCash.findByIdAndDelete(id);
-        if (!deleted) return res.status(404).json({ message: 'Collected cash entry not found.' });
+        if (!deleted) {
+            return res.status(404).json({
+                success: false,
+                error: { code: 'NOT_FOUND', message: 'Collected cash entry not found.' },
+            });
+        }
 
         res.json({ message: 'Collected cash entry deleted.', accessLevel });
     } catch (error) {

@@ -1,64 +1,66 @@
-// server.js
-
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const helmet = require('helmet');
 const cors = require('cors');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const errorHandler = require('./middlewares/ErrorHandler');
+const { getEmailDiagnostics } = require('./utils/Email');
 const collectedCashRoutes = require('./routers/collectedCashRoutes');
 const userRouter = require('./routers/UserRouters');
 const solutionCardRouter = require('./routers/SolutionCardRouters');
 const expenseRouter = require('./routers/ExpenseRouter');
 const dashboardRouter = require('./routers/DashboardRoutes');
+const reportRouter = require('./routers/ReportRoutes');
 const cookieParser = require('cookie-parser');
 
 const app = express();
 app.use(cookieParser());
+app.use(compression());
 
-// --- Security Middlewares ---
 app.use(
     helmet({
-        crossOriginResourcePolicy: false, // needed for React static assets
+        crossOriginResourcePolicy: false,
     })
 );
 
-// --- CORS Setup ---
 const allowedOrigins = [
-    'http://localhost:5173', // Local dev
-    'https://expense-tracker-vija-apps.netlify.app', // Netlify frontend
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://expense-tracker-vija-apps.netlify.app',
 ];
 
 app.use(
     cors({
         origin: function (origin, callback) {
-            if (!origin) return callback(null, true); // Allow non-browser requests
+            if (!origin) return callback(null, true);
             if (allowedOrigins.includes(origin)) {
                 return callback(null, true);
-            } else {
-                return callback(new Error('Not allowed by CORS'));
             }
+            return callback(new Error('Not allowed by CORS'));
         },
         credentials: true,
     })
 );
 
-
-// --- Rate Limiting ---
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes window
-    max: 100, // limit each IP to 100 requests
+    windowMs: 15 * 60 * 1000,
+    max: 300,
     standardHeaders: true,
     legacyHeaders: false,
-    message: 'Too many requests from this IP, please try again after 15 minutes',
+    message: {
+        success: false,
+        error: {
+            code: 'RATE_LIMIT',
+            message: 'Too many requests from this IP, please try again after 15 minutes',
+        },
+    },
 });
 app.use('/api', apiLimiter);
 
-// --- Body Parser ---
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
-// --- MongoDB Connection Caching ---
 let cached = global.mongoose;
 if (!cached) {
     cached = global.mongoose = { conn: null, promise: null };
@@ -70,28 +72,52 @@ async function connectToDatabase() {
     }
 
     if (!cached.promise) {
-        cached.promise = mongoose.connect(process.env.MONGO_URI).then((mongoose) => mongoose);
+        cached.promise = mongoose
+            .connect(process.env.MONGO_URI, {
+                maxPoolSize: 20,
+                minPoolSize: 2,
+                serverSelectionTimeoutMS: 10000,
+            })
+            .then((mongooseConn) => mongooseConn);
     }
     cached.conn = await cached.promise;
     return cached.conn;
 }
 
-// --- Routes ---
 app.use('/api', userRouter);
 app.use('/api/solution', solutionCardRouter);
 app.use('/api/expense', expenseRouter);
 app.use('/api/collected-cash', collectedCashRoutes);
 app.use('/api', dashboardRouter);
+app.use('/api/reports', reportRouter);
 
-// --- Error Handling Middleware ---
+// JSON 404 for unknown API paths
+app.use('/api', (req, res) => {
+    res.status(404).json({
+        success: false,
+        error: {
+            code: 'NOT_FOUND',
+            message: `API route not found: ${req.method} ${req.originalUrl}`,
+        },
+    });
+});
+
 app.use(errorHandler);
 
-// --- Start Server ---
 const PORT = process.env.PORT || 5000;
 
 connectToDatabase()
     .then(() => {
         console.log('MongoDB connected');
+        const emailDiag = getEmailDiagnostics();
+        console.log(`[Email] transport=${emailDiag.transport} sender=${emailDiag.sender}`);
+        if (emailDiag.freeSenderWarning) {
+            console.warn(
+                '[Email] WARNING: EMAIL_FROM uses a free provider (@gmail.com etc). ' +
+                    'Brevo may replace the sender or deliver poorly to external inboxes. ' +
+                    'Verify sender in Brevo or use a custom domain for reliable delivery.'
+            );
+        }
         app.listen(PORT, () => {
             console.log(`Server is running on port ${PORT}`);
         });

@@ -80,5 +80,7 @@ solutionCardSchema.pre('save', function (next) {
 // Indexes for faster querying
 solutionCardSchema.index({ owner: 1 });
 solutionCardSchema.index({ 'sharedWith.user': 1 });
+solutionCardSchema.index({ isDeleted: 1, updatedAt: -1 });
+solutionCardSchema.index({ owner: 1, isDeleted: 1 });
 
 module.exports = mongoose.model('SolutionCard', solutionCardSchema);

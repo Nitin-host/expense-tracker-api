@@ -1,10 +1,10 @@
 const SolutionCard = require('../models/SolutionCard');
-const path = require('path');
-const fs = require('fs');
 const User = require('../models/User');
 const { BadRequestError, NotFoundError, ForbiddenError } = require('../utils/Errors');
 const { checkPermission } = require('../utils/checkPermission');
 const { sendEmail } = require('../utils/Email');
+const { buildSolutionSharedEmail } = require('../utils/emailTemplate');
+const { parsePagination, buildPaginatedResponse } = require('../utils/pagination');
 require('dotenv').config();
 
 // Helper: check if user has access, returns role or null
@@ -48,27 +48,26 @@ const createSolutionCard = async (req, res, next) => {
 const getSolutionCards = async (req, res, next) => {
     try {
         const userId = req.user.userId;
+        const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 24, maxLimit: 50 });
 
-        // Find solution cards owned or shared with the user
-        const cards = await SolutionCard.find({
+        const filter = {
             isDeleted: false,
             $or: [
                 { owner: userId },
                 { 'sharedWith.user': userId },
             ],
-        })
-            .sort({ year: -1 })
-            // Populate sharedWith.user with name and email fields only
-            .populate({
-                path: 'sharedWith.user',
-                select: 'name email'
-            })
-            .populate({
-                path: 'owner',
-                select: 'name email'
-            });
+        };
 
-        // Transform cards to structure sharedWith array with user info flat
+        const [total, cards] = await Promise.all([
+            SolutionCard.countDocuments(filter),
+            SolutionCard.find(filter)
+                .sort({ year: -1 })
+                .skip(skip)
+                .limit(limit)
+                .populate({ path: 'sharedWith.user', select: 'name email' })
+                .populate({ path: 'owner', select: 'name email' }),
+        ]);
+
         const transformed = cards.map(card => {
             const sharedWith = card.sharedWith.map(su => ({
                 user: su.user._id,
@@ -84,7 +83,16 @@ const getSolutionCards = async (req, res, next) => {
             };
         });
 
-        res.json(transformed);
+        res.json(
+            buildPaginatedResponse({
+                data: transformed,
+                page,
+                limit,
+                total,
+                // Backward-compatible: clients that expect a bare array still get data via .data
+                // Also spread array-like for older clients that check Array.isArray — keep `data` primary
+            })
+        );
     } catch (error) {
         next(error);
     }
@@ -196,9 +204,8 @@ const shareSolutionCard = async (req, res, next) => {
             throw new BadRequestError('sharedWith must be an array');
         }
 
-        const oldSharedUserIds = (card.sharedWith || []).map(u => u.user.toString());
+        const oldSharedUserIds = (card.sharedWith || []).map((u) => u.user.toString());
 
-        const enriched = [];
         for (const item of sharedWith) {
             if (!item.user || !item.role) {
                 throw new BadRequestError('Each sharedWith item must have user and role');
@@ -206,49 +213,59 @@ const shareSolutionCard = async (req, res, next) => {
             if (!['editor', 'viewer'].includes(item.role)) {
                 throw new BadRequestError('Role must be either editor or viewer');
             }
-            const user = await User.findById(item.user).select('name email');
+        }
+
+        const userIds = [...new Set(sharedWith.map((item) => String(item.user)))];
+        const users = await User.find({ _id: { $in: userIds } }).select('name email').lean();
+        const userMap = Object.fromEntries(users.map((u) => [u._id.toString(), u]));
+
+        const enriched = sharedWith.map((item) => {
+            const user = userMap[String(item.user)];
             if (!user) throw new NotFoundError(`User ${item.user} not found`);
-            enriched.push({
+            return {
                 user: user._id,
                 name: user.name,
                 email: user.email,
-                role: item.role
-            });
-        }
+                role: item.role,
+            };
+        });
 
         card.sharedWith = enriched;
         await card.save();
 
         if (notifyUsers) {
-            const owner = await User.findById(userId).select('name');
-            const newUsers = enriched.filter(u => !oldSharedUserIds.includes(u.user.toString()));
+            const owner = await User.findById(userId).select('name').lean();
+            const newUsers = enriched.filter((u) => !oldSharedUserIds.includes(u.user.toString()));
 
             if (newUsers.length > 0) {
-                const templatePath = path.join(__dirname, '..', 'templates', 'solutionShared.html');
-                const templateSource = fs.readFileSync(templatePath, 'utf8');
-
-                await Promise.all(newUsers.map(async (user) => {
-                    const htmlContent = templateSource
-                        .replace(/{{name}}/g, user.name.trim())
-                        .replace(/{{ownerName}}/g, owner.name.trim())
-                        .replace(/{{role}}/g, user.role.trim())
-                        .replace(/{{solutionName}}/g, card.name || 'Untitled Solution')
-                        .replace(/{{solutionLink}}/g, `${process.env.FRONTEND_BASE_URL}/solutions`)
-                        .replace(/{{year}}/g, new Date().getFullYear());
-
-                    await sendEmail(
-                        user.email,
-                        `Solution "${card.name}" Shared with You`,
-                        htmlContent
-                    );
-                }));
+                // Respond first; send share emails in background
+                setImmediate(() => {
+                    Promise.all(
+                        newUsers.map(async (user) => {
+                            const { html, text } = await buildSolutionSharedEmail({
+                                name: user.name,
+                                ownerName: owner?.name || 'Someone',
+                                role: user.role,
+                                solutionName: card.name,
+                                solutionId: card._id.toString(),
+                            });
+                            await sendEmail(
+                                user.email,
+                                `Solution "${card.name}" shared with you`,
+                                html,
+                                text
+                            );
+                        })
+                    ).catch((err) => console.error('Share notification email failed:', err.message));
+                });
             }
         }
 
         res.json({
             message: 'Solution sharing updated successfully',
-            sharedWith: card.sharedWith
+            sharedWith: card.sharedWith,
         });
+        return;
     } catch (error) {
         next(error);
     }

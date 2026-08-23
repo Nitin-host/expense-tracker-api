@@ -29,6 +29,10 @@ const expenseSchema = new mongoose.Schema({
     // createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
+expenseSchema.index({ solutionCard: 1, isDeleted: 1, createdAt: -1 });
+expenseSchema.index({ solutionCard: 1, isDeleted: 1, category: 1 });
+expenseSchema.index({ paidBy: 1, createdAt: -1 });
+
 // Auto-update advancePaid, pendingAmount, paymentStatus before saving
 expenseSchema.pre('save', function (next) {
     this.advancePaid = this.payments.reduce((sum, p) => sum + p.paidAmount, 0);

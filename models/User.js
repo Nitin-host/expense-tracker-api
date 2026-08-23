@@ -31,4 +31,8 @@ const userSchema = new mongoose.Schema({
     passwordResetOTPExpiresAt: { type: Date, default: null }     // Expiry of OTP
 }, { timestamps: true });
 
+userSchema.index({ 'refreshTokens.token': 1 });
+userSchema.index({ createdBy: 1, createdAt: -1 });
+userSchema.index({ role: 1, name: 1 });
+
 module.exports = mongoose.model('User', userSchema);

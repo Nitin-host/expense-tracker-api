@@ -4,21 +4,31 @@ const cloudinary = require('../utils/Cloudinary');
 const fs = require('fs');
 const { BadRequestError, NotFoundError } = require('../utils/Errors');
 const { checkPermission } = require('../utils/checkPermission');
+const { parsePagination, buildPaginatedResponse } = require('../utils/pagination');
+const { toLeanExpense, sanitizeExpenseForClient } = require('../utils/expenseDto');
+const { logAudit } = require('../utils/auditLog');
+const { notifyExpenseAdded } = require('../utils/notifyExpense');
+const User = require('../models/User');
 
-// Helper: uploads multiple screenshots, returns arrays of URLs and public IDs
+// Helper: uploads multiple screenshots in parallel, returns arrays of URLs and public IDs
 async function uploadUPIScreenshots(files) {
-    const urls = [];
-    const publicIds = [];
-    for (const file of files) {
-        const result = await cloudinary.uploader.upload(file.path, {
-            folder: 'expense-uploads/upi-screenshots',
-            resource_type: 'image',
-        });
-        urls.push(result.secure_url);
-        publicIds.push(result.public_id);
-        fs.unlinkSync(file.path);
-    }
-    return { urls, publicIds };
+    const results = await Promise.all(
+        files.map(async (file) => {
+            try {
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'expense-uploads/upi-screenshots',
+                    resource_type: 'image',
+                });
+                return { url: result.secure_url, publicId: result.public_id };
+            } finally {
+                fs.promises.unlink(file.path).catch(() => {});
+            }
+        })
+    );
+    return {
+        urls: results.map((r) => r.url),
+        publicIds: results.map((r) => r.publicId),
+    };
 }
 
 // Create new expense
@@ -71,7 +81,30 @@ const createExpense = async (req, res, next) => {
         });
 
         await newExpense.save();
-        res.status(201).json({ message: 'Expense created successfully.', expense: newExpense, accessLevel });
+        const populated = await Expense.findById(newExpense._id).populate('paidBy', 'name email');
+
+        const actor = await User.findById(userId).select('name');
+        await logAudit({
+            entityType: 'expense',
+            entityId: newExpense._id,
+            action: 'create',
+            actorId: userId,
+            actorName: actor?.name || '',
+            solutionCardId: solutionCardId,
+            summary: `Expense created: ${name} ₹${amount}`,
+        });
+
+        notifyExpenseAdded({
+            expense: newExpense,
+            solutionCardId,
+            addedByUserId: userId,
+        }).catch((err) => console.error('Expense notification failed:', err.message));
+
+        res.status(201).json({
+            message: 'Expense created successfully.',
+            expense: sanitizeExpenseForClient(populated),
+            accessLevel,
+        });
     } catch (error) {
         if (req.files && req.files.length) {
             req.files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
@@ -123,7 +156,12 @@ const addPayment = async (req, res, next) => {
 
         expense.payments.push(paymentObj);
         await expense.save();
-        res.json({ message: 'Payment added successfully.', expense, accessLevel });
+        const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
+        res.json({
+            message: 'Payment added successfully.',
+            expense: sanitizeExpenseForClient(populated),
+            accessLevel,
+        });
     } catch (error) {
         if (req.files && req.files.length) {
             req.files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
@@ -132,11 +170,14 @@ const addPayment = async (req, res, next) => {
     }
 };
 
-// Retrieve expenses by solution card
+// Retrieve expenses by solution card (paginated, lean by default)
 const getExpensesBySolutionCard = async (req, res, next) => {
     try {
         const userId = req.user.userId;
         const { solutionCardId } = req.params;
+        const { category, paymentStatus, from, to, q, include } = req.query;
+        const { page, limit, skip } = parsePagination(req.query);
+        const includeFull = include === 'full';
 
         const { role: accessLevel } = await checkPermission({
             resourceType: 'solution',
@@ -146,11 +187,68 @@ const getExpensesBySolutionCard = async (req, res, next) => {
             allowOwner: true
         });
 
-        const expenses = await Expense.find({ solutionCard: solutionCardId })
-            .populate('paidBy', 'name email')
-            .sort({ createdAt: -1 });
+        const filter = {
+            solutionCard: solutionCardId,
+            isDeleted: { $ne: true },
+        };
 
-        res.json({ expenses, accessLevel });
+        if (category) filter.category = category;
+        if (paymentStatus) filter.paymentStatus = paymentStatus;
+        if (from || to) {
+            filter.createdAt = {};
+            if (from) filter.createdAt.$gte = new Date(from);
+            if (to) filter.createdAt.$lte = new Date(to);
+        }
+        if (q) {
+            filter.$or = [
+                { name: { $regex: q, $options: 'i' } },
+                { category: { $regex: q, $options: 'i' } },
+            ];
+        }
+
+        const [total, expenses] = await Promise.all([
+            Expense.countDocuments(filter),
+            Expense.find(filter)
+                .populate('paidBy', 'name email')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit),
+        ]);
+
+        const mapped = includeFull
+            ? expenses.map(sanitizeExpenseForClient)
+            : expenses.map(toLeanExpense);
+
+        res.json(
+            buildPaginatedResponse({
+                data: mapped,
+                page,
+                limit,
+                total,
+                extra: { expenses: mapped, accessLevel },
+            })
+        );
+    } catch (error) {
+        next(error);
+    }
+};
+
+// Get single expense with full payment/screenshot details
+const getExpenseById = async (req, res, next) => {
+    try {
+        const userId = req.user.userId;
+        const { id } = req.params;
+
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: id,
+            userId,
+            allowedRoles: ['viewer', 'editor'],
+            allowOwner: true,
+        });
+
+        const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
+        res.json({ expense: sanitizeExpenseForClient(populated), accessLevel });
     } catch (error) {
         next(error);
     }
@@ -236,18 +334,30 @@ const updateExpense = async (req, res, next) => {
         }
 
         if (req.files && req.files.length > 0) {
-            const newScreenshotUrls = req.files.map(file => `/uploads/${file.filename}`);
+            const uploaded = await uploadUPIScreenshots(req.files);
             if (expense.payments.length > 0) {
                 expense.payments[0].upiScreenshotUrls = [
                     ...(expense.payments[0].upiScreenshotUrls || []),
-                    ...newScreenshotUrls,
+                    ...uploaded.urls,
+                ];
+                expense.payments[0].upiScreenshotPublicIds = [
+                    ...(expense.payments[0].upiScreenshotPublicIds || []),
+                    ...uploaded.publicIds,
                 ];
             }
         }
 
         await expense.save();
-        res.json({ message: 'Expense updated successfully.', expense, accessLevel });
+        const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
+        res.json({
+            message: 'Expense updated successfully.',
+            expense: sanitizeExpenseForClient(populated),
+            accessLevel,
+        });
     } catch (error) {
+        if (req.files && req.files.length) {
+            req.files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
+        }
         next(error);
     }
 };
@@ -270,15 +380,22 @@ const deleteExpense = async (req, res, next) => {
             throw new BadRequestError('You do not have permission to delete this expense.');
         }
 
+        const publicIds = [];
         for (const payment of expense.payments) {
-            if (payment.upiScreenshotPublicIds && Array.isArray(payment.upiScreenshotPublicIds)) {
-                for (const publicId of payment.upiScreenshotPublicIds) {
-                    await cloudinary.uploader.destroy(publicId);
-                }
+            if (Array.isArray(payment.upiScreenshotPublicIds)) {
+                publicIds.push(...payment.upiScreenshotPublicIds.filter(Boolean));
             }
         }
+        if (publicIds.length) {
+            await Promise.all(
+                publicIds.map((publicId) =>
+                    cloudinary.uploader.destroy(publicId).catch((err) => {
+                        console.error(`Cloudinary destroy failed for ${publicId}:`, err.message);
+                    })
+                )
+            );
+        }
 
-        expense.isDeleted = true;
         await expense.deleteOne();
         res.json({ message: 'Expense deleted successfully.', accessLevel });
     } catch (error) {
@@ -334,12 +451,23 @@ const getDeletedExpensesBySolutionCard = async (req, res, next) => {
             throw new BadRequestError('Only owner can view deleted expenses.');
         }
 
-        const deletedExpenses = await Expense.find({
-            solutionCard: solutionCardId,
-            isDeleted: true
-        }).sort({ createdAt: -1 });
+        const { page, limit, skip } = parsePagination(req.query);
+        const filter = { solutionCard: solutionCardId, isDeleted: true };
+        const [total, deletedExpenses] = await Promise.all([
+            Expense.countDocuments(filter),
+            Expense.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+        ]);
 
-        res.json({ deletedExpenses, accessLevel });
+        const mapped = deletedExpenses.map(toLeanExpense);
+        res.json(
+            buildPaginatedResponse({
+                data: mapped,
+                page,
+                limit,
+                total,
+                extra: { deletedExpenses: mapped, accessLevel },
+            })
+        );
     } catch (error) {
         next(error);
     }
@@ -349,6 +477,7 @@ module.exports = {
     createExpense,
     addPayment,
     getExpensesBySolutionCard,
+    getExpenseById,
     updateExpense,
     deleteExpense,
     restoreExpense,

@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Solution Shared with You - Expense Tracker</title>
+    <title>New Expense - Expense Tracker</title>
     <style>
         .container {
             max-width: 500px;
@@ -17,30 +17,26 @@
             color: #0f172a;
         }
 
-        .header {
-            text-align: center;
-            margin-bottom: 24px;
-        }
-
         .header h2 {
             color: #0f766e;
-            margin: 0 0 8px;
+            margin: 0 0 16px;
         }
 
         .content {
-            margin-bottom: 20px;
             font-size: 1.05em;
             line-height: 1.6;
         }
 
-        .highlight-box {
+        .details {
             background: #ecfdf5;
             border-left: 4px solid #0f766e;
-            font-weight: 600;
-            padding: 16px;
-            font-size: 1.05em;
+            padding: 16px 20px;
             margin: 18px 0;
-            text-align: center;
+            list-style: none;
+        }
+
+        .details li {
+            margin: 6px 0;
         }
 
         .button {
@@ -51,14 +47,12 @@
             border-radius: 8px;
             text-decoration: none;
             font-size: 1.05em;
-            margin: 20px auto;
         }
 
         .footer {
-            margin-top: 28px;
+            margin-top: 24px;
             color: #64748b;
             font-size: 0.95em;
-            text-align: center;
         }
     </style>
 </head>
@@ -66,25 +60,21 @@
 <body>
     <div class="container">
         <div class="header">
-            <h2>Expense Tracker</h2>
-            <p>Solution shared with you</p>
+            <h2>New expense added</h2>
         </div>
         <div class="content">
-            Hi <b>{{name}}</b>,<br /><br />
-            <b>{{ownerName}}</b> has shared the solution <b>{{solutionName}}</b> with you as a <b>{{role}}</b>.
-        </div>
-        <div class="highlight-box">
-            You can now access and collaborate on this solution.
-        </div>
-        <div class="content" style="text-align:center;">
-            <a href="{{solutionLink}}" class="button">View {{solutionName}}</a>
-        </div>
-        <div class="content">
-            If you were not expecting this, you can safely ignore this email.
+            <p><strong>{{addedBy}}</strong> added an expense to <strong>{{solutionName}}</strong>.</p>
+            <ul class="details">
+                <li><strong>Name:</strong> {{expenseName}}</li>
+                <li><strong>Category:</strong> {{category}}</li>
+                <li><strong>Amount:</strong> ₹{{amount}}</li>
+            </ul>
+            <p style="text-align:center;">
+                <a href="{{expenseLink}}" class="button">View expenses</a>
+            </p>
         </div>
         <div class="footer">
-            &mdash; The Expense Tracker Team<br />
-            &copy; {{year}} Expense Tracker
+            &mdash; Expense Tracker
         </div>
     </div>
 </body>

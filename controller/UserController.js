@@ -1,11 +1,11 @@
 const User = require('../models/User');
 const SolutionCard = require('../models/SolutionCard')
 const bcrypt = require('bcrypt');
-const fs = require('fs/promises');
-const path = require('path');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendEmail } = require('../utils/Email');
+const { buildUserWelcomeEmail, normalizeEmail } = require('../utils/userWelcomeEmail');
+const { buildPasswordResetOtpEmail } = require('../utils/emailTemplate');
 const { BadRequestError, UnauthorizedError, ForbiddenError, NotFoundError } = require('../utils/Errors');
 require('dotenv').config();
 
@@ -14,7 +14,7 @@ const generateAccessToken = (user) => {
     return jwt.sign(
         { userId: user._id, role: user.role },
         process.env.JWT_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn: '1h' }
     );
 };
 
@@ -108,20 +108,50 @@ const login = async (req, res, next) => {
         const { email, password } = req.body;
 
         if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password are required' });
+            return res.status(400).json({
+                success: false,
+                error: { code: 'BAD_REQUEST', message: 'Email and password are required' },
+            });
         }
 
         const user = await User.findOne({ email: email.toLowerCase() });
-        if (!user) return res.status(400).json({ message: 'Invalid credentials' });
+        if (!user) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' },
+            });
+        }
 
         const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+        if (!isMatch) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' },
+            });
+        }
 
         const accessToken = generateAccessToken(user);
+        const refreshToken = generateRefreshToken();
+
+        user.refreshTokens = (user.refreshTokens || []).filter((rt) => rt.expiresAt > new Date());
+        user.refreshTokens.push({
+            token: refreshToken,
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        });
+        await user.save();
+
+        const cookieOptions = {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'Strict',
+            maxAge: 7 * 24 * 60 * 60 * 1000,
+        };
+        res.cookie('refreshToken', refreshToken, cookieOptions);
 
         res.json({
             message: 'Login successful',
             token: accessToken,
+            refreshToken,
             user: {
                 id: user._id,
                 name: user.name,
@@ -135,19 +165,31 @@ const login = async (req, res, next) => {
 };
 
 const refreshAccessToken = async (req, res, next) => {
-    const token = req.cookies.refreshToken;
-    if (!token) return res.status(401).json({ message: 'No refresh token provided' });
+    const token = req.body?.refreshToken || req.cookies?.refreshToken;
+    if (!token) {
+        return res.status(401).json({
+            success: false,
+            error: { code: 'NO_REFRESH_TOKEN', message: 'No refresh token provided' },
+        });
+    }
 
     try {
         const user = await User.findOne({ 'refreshTokens.token': token });
-        if (!user) return res.status(403).json({ message: 'Invalid refresh token' });
+        if (!user) {
+            return res.status(403).json({
+                success: false,
+                error: { code: 'INVALID_REFRESH', message: 'Invalid refresh token' },
+            });
+        }
 
         const oldToken = user.refreshTokens.find(rt => rt.token === token);
         if (!oldToken || oldToken.expiresAt < new Date()) {
-            return res.status(403).json({ message: 'Refresh token expired' });
+            return res.status(403).json({
+                success: false,
+                error: { code: 'REFRESH_EXPIRED', message: 'Refresh token expired' },
+            });
         }
 
-        // Remove old token
         user.refreshTokens = user.refreshTokens.filter(rt => rt.token !== token);
 
         const newAccessToken = generateAccessToken(user);
@@ -162,13 +204,12 @@ const refreshAccessToken = async (req, res, next) => {
 
         res.cookie('refreshToken', newRefreshToken, {
             httpOnly: true,
-            secure: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'Strict',
             maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
-        res.json({ token: newAccessToken });
+        res.json({ token: newAccessToken, refreshToken: newRefreshToken });
     } catch (err) {
         console.error('Refresh error:', err);
         next(err);
@@ -177,7 +218,7 @@ const refreshAccessToken = async (req, res, next) => {
 
 const logout = async (req, res, next) => {
     try {
-        const token = req.cookies.refreshToken;
+        const token = req.body?.refreshToken || req.cookies?.refreshToken;
         if (!token) return res.status(204).send();
 
         const user = await User.findOne({ 'refreshTokens.token': token });
@@ -188,7 +229,7 @@ const logout = async (req, res, next) => {
 
         res.clearCookie('refreshToken', {
             httpOnly: true,
-            secure: true,
+            secure: process.env.NODE_ENV === 'production',
             sameSite: 'Strict',
         });
         res.status(204).send();
@@ -243,36 +284,52 @@ const createUserBySuperAdmin = async (req, res, next) => {
         const { name, email, role } = req.body;
         if (!name || !email || !role) throw new BadRequestError('Name, email, and role are required.');
 
-        const existingUser = await User.findOne({ email: email.toLowerCase() });
-        if (existingUser) throw new BadRequestError('User with this email already exists.');
+        const normalizedEmail = normalizeEmail(email);
+        if (!normalizedEmail) throw new BadRequestError('Valid email is required.');
+
+        const existingUser = await User.findOne({ email: normalizedEmail });
+        if (existingUser) {
+            throw new BadRequestError(
+                'A user with this email already exists. Check the users list — they may have registered directly or were created earlier.'
+            );
+        }
 
         const tempPassword = crypto.randomBytes(6).toString('hex');
         const hashedTempPassword = await bcrypt.hash(tempPassword, 10);
         const tempPasswordExpiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
 
+        const { html, text } = await buildUserWelcomeEmail({
+            name,
+            tempPassword,
+            email: normalizedEmail,
+        });
+
+        const messageId = await sendEmail(
+            normalizedEmail,
+            'Your Account Created - Expense Tracker',
+            html,
+            text
+        );
+
         const newUser = new User({
             name,
-            email: email.toLowerCase(),
+            email: normalizedEmail,
             role,
             password: hashedTempPassword,
             tempPasswordExpiresAt,
             passwordChanged: false,
-            createdBy: req.user && req.user._id,
+            createdBy: req.user?.userId || null,
             refreshTokens: [],
         });
 
         await newUser.save();
 
-        const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
-        const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
-        let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
-
-        htmlTemplate = htmlTemplate.replace(/{{name}}/g, name)
-            .replace(/{{tempPassword}}/g, tempPassword)
-            .replace(/{{resetLink}}/g, resetLink);
-
-        await sendEmail(email, 'Your Account Created - Expense Tracker', htmlTemplate);
-        res.status(201).json({ message: 'User created and email sent.' });
+        res.status(201).json({
+            message: `User created. Welcome email sent to ${normalizedEmail}.`,
+            emailSent: true,
+            messageId,
+            userId: newUser._id,
+        });
     } catch (error) {
         next(error);
     }
@@ -280,12 +337,34 @@ const createUserBySuperAdmin = async (req, res, next) => {
 
 const getCreatedUsers = async (req, res, next) => {
     try {
-        // req.user is populated by authenticateToken middleware (should contain _id and role)
-        const creatorId = req.user._id;
-        const users = await User.find({ createdBy: creatorId })
-            .select('-password -refreshTokens') // exclude sensitive fields
-            .sort({ createdAt: -1 });
-        res.json(users);
+        const creatorId = req.user.userId;
+        const role = req.user.role;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+        const skip = (page - 1) * limit;
+
+        const filter =
+            role === 'super_admin'
+                ? { _id: { $ne: creatorId } }
+                : { createdBy: creatorId };
+
+        const [users, total] = await Promise.all([
+            User.find(filter)
+                .select('-password -refreshTokens')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            User.countDocuments(filter),
+        ]);
+
+        res.json({
+            data: users,
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit) || 1,
+        });
     } catch (error) {
         next(error);
     }
@@ -296,28 +375,29 @@ const requestTempPassword = async (req, res, next) => {
         const { email } = req.body;
         if (!email) throw new BadRequestError('Email is required.');
 
-        const user = await User.findOne({ email: email.toLowerCase() });
+        const normalizedEmail = normalizeEmail(email);
         const genericSuccess = { message: "If your email is registered, you'll receive instructions shortly." };
+
+        const user = await User.findOne({ email: normalizedEmail });
         if (!user) return res.json(genericSuccess);
 
         const tempPassword = crypto.randomBytes(6).toString('hex');
         const hashedTempPassword = await bcrypt.hash(tempPassword, 10);
         const tempPasswordExpiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
 
+        const { html, text } = await buildUserWelcomeEmail({
+            name: user.name,
+            tempPassword,
+            email: normalizedEmail,
+        });
+
+        await sendEmail(normalizedEmail, 'Reset your Password - Expense Tracker', html, text);
+
         user.password = hashedTempPassword;
         user.tempPasswordExpiresAt = tempPasswordExpiresAt;
         user.passwordChanged = false;
         await user.save();
 
-        const resetLink = `${process.env.FRONTEND_BASE_URL}/change-password?email=${encodeURIComponent(email)}&temp=true`;
-        const templatePath = path.join(__dirname, '..', 'templates', 'userCreationEmail.html');
-        let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
-
-        htmlTemplate = htmlTemplate.replace(/{{name}}/g, user.name)
-            .replace(/{{tempPassword}}/g, tempPassword)
-            .replace(/{{resetLink}}/g, resetLink);
-
-        await sendEmail(email, 'Reset your Password - Expense Tracker', htmlTemplate);
         res.json(genericSuccess);
     } catch (error) {
         next(error);
@@ -354,12 +434,23 @@ const changeUserRole = async (req, res, next) => {
 const getAllUsers = async (req, res, next) => {
     try {
         const currentUserId = req.user.userId;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
+        const skip = (page - 1) * limit;
+        const filter = { _id: { $ne: currentUserId } };
 
-        // Find all users except the currently logged-in user
-        const users = await User.find({ _id: { $ne: currentUserId } }, 'name email role')
-            .sort({ name: 1 });
+        const [users, total] = await Promise.all([
+            User.find(filter, 'name email role').sort({ name: 1 }).skip(skip).limit(limit).lean(),
+            User.countDocuments(filter),
+        ]);
 
-        res.json(users);
+        res.json({
+            data: users,
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit) || 1,
+        });
     } catch (error) {
         next(error);
     }
@@ -367,24 +458,36 @@ const getAllUsers = async (req, res, next) => {
 
 const getUsersForSharing = async (req, res, next) => {
     try {
-        const userId = req.user.userId;
         const { solutionCardId } = req.query;
+        const q = String(req.query.q || '').trim();
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
 
         if (!solutionCardId) {
             return res.status(400).json({ message: 'SolutionCard ID required' });
         }
 
-        const solutionCard = await SolutionCard.findById(solutionCardId);
+        const solutionCard = await SolutionCard.findById(solutionCardId).select('owner sharedWith').lean();
         if (!solutionCard) return res.status(404).json({ message: 'Solution card not found' });
 
         const excludedUserIds = [
             solutionCard.owner.toString(),
-            ...solutionCard.sharedWith.map(su => su.user.toString()),
+            ...(solutionCard.sharedWith || []).map((su) => su.user.toString()),
         ];
 
-        const users = await User.find({
+        const filter = {
             _id: { $nin: excludedUserIds },
-        }, 'name email role').sort({ name: 1 });
+        };
+        if (q) {
+            filter.$or = [
+                { name: { $regex: q, $options: 'i' } },
+                { email: { $regex: q, $options: 'i' } },
+            ];
+        }
+
+        const users = await User.find(filter, 'name email role')
+            .sort({ name: 1 })
+            .limit(limit)
+            .lean();
 
         res.json(users);
     } catch (error) {
@@ -434,32 +537,29 @@ const sendPasswordResetOTP = async (req, res, next) => {
         const { email } = req.body;
         if (!email) throw new BadRequestError('Email is required');
 
-        const user = await User.findOne({ email: email.toLowerCase() });
-        if (!user) return res.json({ message: "If your email is registered, you'll receive an OTP." }); // Avoid info leak
+        const normalizedEmail = normalizeEmail(email);
+        const genericSuccess = { message: "If your email is registered, you'll receive an OTP." };
 
-        // Generate OTP & expiry (10 minutes)
+        const user = await User.findOne({ email: normalizedEmail });
+        if (!user) return res.json(genericSuccess);
+
         const otp = generateOTP();
         const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-        // Optionally hash OTP before saving for security (recommended)
         const hashedOTP = await bcrypt.hash(otp, 10);
+
+        const { html, text } = await buildPasswordResetOtpEmail({
+            name: user.name,
+            otp,
+            expiryMinutes: 10,
+        });
+
+        await sendEmail(normalizedEmail, 'Password Reset OTP - Expense Tracker', html, text);
 
         user.passwordResetOTP = hashedOTP;
         user.passwordResetOTPExpiresAt = otpExpiresAt;
         await user.save();
 
-        // Send email with OTP
-        const templatePath = path.join(__dirname, '..', 'templates', 'forgetPasswordEmail.html');
-        let htmlTemplate = await fs.readFile(templatePath, 'utf-8');
-        htmlTemplate = htmlTemplate
-            .replace(/{{name}}/g, user.name)
-            .replace(/{{otp}}/g, otp)
-            .replace(/{{expiryMinutes}}/g, '10');
-
-        // Send email
-        await sendEmail(user.email, 'Password Reset OTP - Expense Tracker', htmlTemplate);
-
-        res.json({ message: "If your email is registered, you'll receive an OTP." });
+        res.json(genericSuccess);
     } catch (error) {
         next(error);
     }
