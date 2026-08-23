@@ -244,9 +244,6 @@ const shareSolutionCard = async (req, res, next) => {
         card.sharedWith = enriched;
         await card.save();
 
-        let emailsSent = 0;
-        const emailErrors = [];
-
         if (notifyUsers) {
             const owner = await User.findById(userId).select('name').lean();
             const explicitNotifyIds = new Set(
@@ -260,7 +257,7 @@ const shareSolutionCard = async (req, res, next) => {
                 return !oldSharedUserIds.has(id) || explicitNotifyIds.has(id);
             });
 
-            const results = await Promise.allSettled(
+            Promise.allSettled(
                 toNotify.map(async (user) => {
                     const { html, text } = await buildSolutionSharedEmail({
                         name: user.name,
@@ -276,25 +273,21 @@ const shareSolutionCard = async (req, res, next) => {
                         text
                     );
                 })
-            );
-
-            results.forEach((result, index) => {
-                if (result.status === 'fulfilled') {
-                    emailsSent += 1;
-                    return;
-                }
-                const failedUser = toNotify[index];
-                const message = result.reason?.message || 'Unknown email error';
-                console.error(`Share notification email failed for ${failedUser?.email}:`, message);
-                emailErrors.push({ email: failedUser?.email, error: message });
+            ).then((results) => {
+                results.forEach((result, index) => {
+                    if (result.status === 'fulfilled') return;
+                    const failedUser = toNotify[index];
+                    const message = result.reason?.message || 'Unknown email error';
+                    console.error(`Share notification email failed for ${failedUser?.email}:`, message);
+                });
+            }).catch((err) => {
+                console.error('Share notification batch failed:', err.message);
             });
         }
 
         res.json({
             message: 'Solution sharing updated successfully',
             sharedWith: card.sharedWith,
-            emailsSent,
-            ...(emailErrors.length ? { emailErrors } : {}),
         });
         return;
     } catch (error) {

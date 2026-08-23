@@ -20,6 +20,54 @@ function yearRange(year) {
     };
 }
 
+/** Local calendar day bounds for YYYY-MM-DD (server local timezone). */
+function dayRange(dateStr) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || '').trim());
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (!year || month < 1 || month > 12 || day < 1 || day > 31) return null;
+    const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+    const end = new Date(year, month - 1, day, 23, 59, 59, 999);
+    if (Number.isNaN(start.getTime()) || start.getDate() !== day) return null;
+    return { start, end, date: `${match[1]}-${match[2]}-${match[3]}` };
+}
+
+function todayDateParam() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
+
+function summarizeMethodRows(rows) {
+    const byMethod = { cash: 0, upi: 0 };
+    let cashCount = 0;
+    let upiCount = 0;
+    for (const row of rows) {
+        const method = String(row._id || 'cash').toLowerCase();
+        const amount = Number(row.amount) || 0;
+        const count = Number(row.count) || 0;
+        if (method === 'upi') {
+            byMethod.upi = amount;
+            upiCount = count;
+        } else {
+            byMethod.cash += amount;
+            cashCount += count;
+        }
+    }
+    return {
+        cash: byMethod.cash,
+        upi: byMethod.upi,
+        total: byMethod.cash + byMethod.upi,
+        cashCount,
+        upiCount,
+        count: cashCount + upiCount,
+    };
+}
+
 function formatDate(val) {
     if (!val) return '';
     const d = val instanceof Date ? val : new Date(val);
@@ -65,6 +113,7 @@ const EXPORT_TITLES = {
     summary: 'Financial Summary Report',
     expenses: 'Expense Details Report',
     'collected-cash': 'Collected Cash Report',
+    daily: 'Daily Report',
 };
 
 function withExportCap(query, limit = EXPORT_ROW_LIMIT) {
@@ -216,6 +265,158 @@ exports.getReports = async (req, res, next) => {
     }
 };
 
+exports.getDailyReport = async (req, res, next) => {
+    try {
+        const { solutionCardId } = req.params;
+        const userId = req.user.userId;
+        const dateParam = req.query.date || todayDateParam();
+        const range = dayRange(dateParam);
+
+        if (!mongoose.Types.ObjectId.isValid(solutionCardId)) {
+            throw new BadRequestError('Invalid solutionCardId');
+        }
+        if (!range) {
+            throw new BadRequestError('Invalid date. Use YYYY-MM-DD.');
+        }
+
+        await checkPermission({
+            resourceType: 'solution',
+            resourceId: solutionCardId,
+            userId,
+            allowedRoles: ['viewer', 'editor'],
+            allowOwner: true,
+        });
+
+        const solutionObjectId = new mongoose.Types.ObjectId(solutionCardId);
+        const expenseMatch = { solutionCard: solutionObjectId, isDeleted: { $ne: true } };
+        const { start, end, date } = range;
+
+        const [
+            paymentDayAgg,
+            collectedByMethod,
+            collectedEntries,
+            overallCollectedAgg,
+            overallExpenseAgg,
+        ] = await Promise.all([
+            Expense.aggregate([
+                { $match: expenseMatch },
+                { $unwind: { path: '$payments', preserveNullAndEmptyArrays: false } },
+                {
+                    $match: {
+                        'payments.paidAt': { $gte: start, $lte: end },
+                    },
+                },
+                {
+                    $facet: {
+                        byMethod: [
+                            {
+                                $group: {
+                                    _id: { $ifNull: ['$payments.paymentMethod', 'cash'] },
+                                    amount: { $sum: '$payments.paidAmount' },
+                                    count: { $sum: 1 },
+                                },
+                            },
+                        ],
+                        rows: [
+                            {
+                                $project: {
+                                    expenseId: '$_id',
+                                    expenseName: '$name',
+                                    category: '$category',
+                                    paidAmount: '$payments.paidAmount',
+                                    paymentMethod: '$payments.paymentMethod',
+                                    paidAt: '$payments.paidAt',
+                                },
+                            },
+                            { $sort: { paidAt: -1 } },
+                        ],
+                    },
+                },
+            ]),
+            CollectedCash.aggregate([
+                {
+                    $match: {
+                        solutionCardId: solutionObjectId,
+                        collectedDate: { $gte: start, $lte: end },
+                    },
+                },
+                {
+                    $group: {
+                        _id: { $ifNull: ['$paymentMethod', 'cash'] },
+                        amount: { $sum: '$amount' },
+                        count: { $sum: 1 },
+                    },
+                },
+            ]),
+            CollectedCash.find({
+                solutionCardId: solutionObjectId,
+                collectedDate: { $gte: start, $lte: end },
+            })
+                .sort({ collectedDate: -1 })
+                .select('name amount paymentMethod collectedDate')
+                .lean(),
+            CollectedCash.aggregate([
+                { $match: { solutionCardId: solutionObjectId } },
+                { $group: { _id: null, total: { $sum: '$amount' } } },
+            ]),
+            Expense.aggregate([
+                { $match: expenseMatch },
+                { $group: { _id: null, total: { $sum: '$amount' } } },
+            ]),
+        ]);
+
+        const paymentDayFacet = paymentDayAgg[0] || { byMethod: [], rows: [] };
+        const spentByMethod = paymentDayFacet.byMethod;
+        const paymentRows = paymentDayFacet.rows;
+
+        const collected = summarizeMethodRows(collectedByMethod);
+        const spent = summarizeMethodRows(spentByMethod);
+        const dayRemaining = collected.total - spent.total;
+        const overallCollected = overallCollectedAgg[0]?.total || 0;
+        const overallExpenses = overallExpenseAgg[0]?.total || 0;
+        const overallRemaining = overallCollected - overallExpenses;
+
+        res.json({
+            date,
+            collected: {
+                total: collected.total,
+                cash: collected.cash,
+                upi: collected.upi,
+                count: collected.count,
+            },
+            spent: {
+                total: spent.total,
+                cash: spent.cash,
+                upi: spent.upi,
+                count: spent.count,
+            },
+            dayRemaining,
+            overall: {
+                collected: overallCollected,
+                expenses: overallExpenses,
+                remaining: overallRemaining,
+            },
+            collectedEntries: collectedEntries.map((c) => ({
+                id: c._id,
+                name: c.name,
+                amount: c.amount,
+                paymentMethod: c.paymentMethod || 'cash',
+                date: c.collectedDate,
+            })),
+            payments: paymentRows.map((p) => ({
+                expenseId: p.expenseId,
+                expenseName: p.expenseName,
+                category: p.category,
+                paidAmount: p.paidAmount,
+                paymentMethod: p.paymentMethod || 'cash',
+                paidAt: p.paidAt,
+            })),
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 exports.exportData = async (req, res, next) => {
     try {
         const { solutionCardId } = req.params;
@@ -252,6 +453,165 @@ exports.exportData = async (req, res, next) => {
             const periodFilters = buildPeriodFilters(year, month, solutionObjectId);
             Object.assign(expenseFilter, periodFilters.expenseFilter);
             Object.assign(cashFilter, periodFilters.cashFilter);
+        }
+
+        if (type === 'daily') {
+            const dateParam = req.query.date || todayDateParam();
+            const range = dayRange(dateParam);
+            if (!range) {
+                throw new BadRequestError('Invalid date. Use YYYY-MM-DD.');
+            }
+
+            const { start, end, date } = range;
+            const expenseMatch = {
+                solutionCard: solutionObjectId,
+                isDeleted: { $ne: true },
+            };
+
+            const [
+                collectedByMethod,
+                spentByMethod,
+                collectedEntries,
+                paymentRows,
+                overallCollectedAgg,
+                overallExpenseAgg,
+            ] = await Promise.all([
+                CollectedCash.aggregate([
+                    {
+                        $match: {
+                            solutionCardId: solutionObjectId,
+                            collectedDate: { $gte: start, $lte: end },
+                        },
+                    },
+                    {
+                        $group: {
+                            _id: { $ifNull: ['$paymentMethod', 'cash'] },
+                            amount: { $sum: '$amount' },
+                            count: { $sum: 1 },
+                        },
+                    },
+                ]),
+                Expense.aggregate([
+                    { $match: expenseMatch },
+                    { $unwind: { path: '$payments', preserveNullAndEmptyArrays: false } },
+                    { $match: { 'payments.paidAt': { $gte: start, $lte: end } } },
+                    {
+                        $group: {
+                            _id: { $ifNull: ['$payments.paymentMethod', 'cash'] },
+                            amount: { $sum: '$payments.paidAmount' },
+                            count: { $sum: 1 },
+                        },
+                    },
+                ]),
+                CollectedCash.find({
+                    solutionCardId: solutionObjectId,
+                    collectedDate: { $gte: start, $lte: end },
+                })
+                    .sort({ collectedDate: -1 })
+                    .lean(),
+                Expense.aggregate([
+                    { $match: expenseMatch },
+                    { $unwind: { path: '$payments', preserveNullAndEmptyArrays: false } },
+                    { $match: { 'payments.paidAt': { $gte: start, $lte: end } } },
+                    {
+                        $project: {
+                            expenseName: '$name',
+                            category: '$category',
+                            paidAmount: '$payments.paidAmount',
+                            paymentMethod: '$payments.paymentMethod',
+                            paidAt: '$payments.paidAt',
+                        },
+                    },
+                    { $sort: { paidAt: -1 } },
+                ]),
+                CollectedCash.aggregate([
+                    { $match: { solutionCardId: solutionObjectId } },
+                    { $group: { _id: null, total: { $sum: '$amount' } } },
+                ]),
+                Expense.aggregate([
+                    { $match: expenseMatch },
+                    { $group: { _id: null, total: { $sum: '$amount' } } },
+                ]),
+            ]);
+
+            const collected = summarizeMethodRows(collectedByMethod);
+            const spent = summarizeMethodRows(spentByMethod);
+            const dayRemaining = collected.total - spent.total;
+            const overallCollected = overallCollectedAgg[0]?.total || 0;
+            const overallExpenses = overallExpenseAgg[0]?.total || 0;
+            const overallRemaining = overallCollected - overallExpenses;
+
+            return res.json(
+                buildExportPayload({
+                    type: 'daily',
+                    solutionName,
+                    periodLabel: formatDateShort(start),
+                    sections: [
+                        {
+                            id: 'daily-stats',
+                            title: `Daily snapshot · ${date}`,
+                            kind: 'stats',
+                            items: [
+                                {
+                                    label: 'Collected today',
+                                    value: collected.total,
+                                    format: 'currency',
+                                    tone: 'success',
+                                },
+                                {
+                                    label: 'Spent today',
+                                    value: spent.total,
+                                    format: 'currency',
+                                    tone: 'warning',
+                                },
+                                {
+                                    label: 'Left today',
+                                    value: dayRemaining,
+                                    format: 'currency',
+                                    tone: dayRemaining < 0 ? 'danger' : 'success',
+                                },
+                                {
+                                    label: 'Overall wallet left',
+                                    value: overallRemaining,
+                                    format: 'currency',
+                                    tone: overallRemaining < 0 ? 'danger' : 'success',
+                                },
+                                { label: 'Collected via cash', value: collected.cash, format: 'currency' },
+                                { label: 'Collected via UPI', value: collected.upi, format: 'currency' },
+                                { label: 'Spent via cash', value: spent.cash, format: 'currency' },
+                                { label: 'Spent via UPI', value: spent.upi, format: 'currency' },
+                            ],
+                        },
+                        {
+                            id: 'daily-collected',
+                            title: 'Collected today',
+                            kind: 'table',
+                            headers: ['Contributor', 'Amount (₹)', 'Method'],
+                            rows: collectedEntries.map((c) => [
+                                c.name,
+                                c.amount,
+                                String(c.paymentMethod || 'cash').toUpperCase(),
+                            ]),
+                            columnFormats: ['text', 'currency', 'text'],
+                            columnAlign: ['left', 'right', 'left'],
+                        },
+                        {
+                            id: 'daily-spent',
+                            title: 'Spent today',
+                            kind: 'table',
+                            headers: ['Expense', 'Category', 'Paid (₹)', 'Method'],
+                            rows: paymentRows.map((p) => [
+                                p.expenseName,
+                                p.category,
+                                p.paidAmount,
+                                String(p.paymentMethod || 'cash').toUpperCase(),
+                            ]),
+                            columnFormats: ['text', 'text', 'currency', 'text'],
+                            columnAlign: ['left', 'left', 'right', 'left'],
+                        },
+                    ],
+                })
+            );
         }
 
         if (type === 'summary') {
@@ -387,9 +747,17 @@ exports.exportData = async (req, res, next) => {
             const totalCollected = entries.reduce((s, c) => s + (Number(c.amount) || 0), 0);
             const truncated = entries.length >= EXPORT_ROW_LIMIT;
 
+            const cashViaCash = entries
+                .filter((r) => String(r.paymentMethod || 'cash').toLowerCase() !== 'upi')
+                .reduce((s, c) => s + (Number(c.amount) || 0), 0);
+            const cashViaUpi = entries
+                .filter((r) => String(r.paymentMethod || '').toLowerCase() === 'upi')
+                .reduce((s, c) => s + (Number(c.amount) || 0), 0);
+
             const tableRows = entries.map((r) => [
                 r.name,
                 r.amount,
+                String(r.paymentMethod || 'cash').toUpperCase(),
                 formatDateShort(r.collectedDate),
                 formatDateShort(r.updatedDate),
             ]);
@@ -406,6 +774,8 @@ exports.exportData = async (req, res, next) => {
                             kind: 'stats',
                             items: [
                                 { label: 'Total collected', value: totalCollected, format: 'currency', tone: 'success' },
+                                { label: 'Via cash', value: cashViaCash, format: 'currency', tone: 'success' },
+                                { label: 'Via UPI', value: cashViaUpi, format: 'currency' },
                                 { label: 'Entries', value: entries.length, format: 'number' },
                                 ...(truncated
                                     ? [{ label: 'Note', value: `Limited to latest ${EXPORT_ROW_LIMIT} rows`, format: 'text' }]
@@ -419,10 +789,10 @@ exports.exportData = async (req, res, next) => {
                                 ? `Latest ${EXPORT_ROW_LIMIT} contributions for this solution.`
                                 : 'Each contribution recorded for this solution.',
                             kind: 'table',
-                            headers: ['Contributor', 'Amount (₹)', 'Collected on', 'Last updated'],
+                            headers: ['Contributor', 'Amount (₹)', 'Method', 'Collected on', 'Last updated'],
                             rows: tableRows,
-                            columnFormats: ['text', 'currency', 'text', 'text'],
-                            columnAlign: ['left', 'right', 'left', 'left'],
+                            columnFormats: ['text', 'currency', 'text', 'text', 'text'],
+                            columnAlign: ['left', 'right', 'left', 'left', 'left'],
                         },
                     ],
                 })
@@ -440,15 +810,28 @@ exports.exportData = async (req, res, next) => {
         const totalAmount = expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
         const totalPaid = expenses.reduce((s, e) => s + (Number(e.advancePaid) || 0), 0);
         const totalPending = expenses.reduce((s, e) => s + (Number(e.pendingAmount) || 0), 0);
+        let expenseCashPaid = 0;
+        let expenseUpiPaid = 0;
+        expenses.forEach((e) => {
+            (e.payments || []).forEach((p) => {
+                const amt = Number(p.paidAmount) || 0;
+                if (String(p.paymentMethod || '').toLowerCase() === 'upi') expenseUpiPaid += amt;
+                else expenseCashPaid += amt;
+            });
+        });
 
         const tableRows = expenses.map((e) => {
             const lean = toLeanExpense(e);
+            const methods = (lean.paymentMethods || [])
+                .map((m) => String(m).toUpperCase())
+                .join(', ');
             return [
                 lean.name,
                 lean.category,
                 lean.amount,
                 lean.advancePaid,
                 lean.pendingAmount,
+                methods || '—',
                 formatPaymentStatus(lean.paymentStatus),
                 lean.paidBy?.name || '—',
                 formatDateShort(lean.createdAt),
@@ -468,6 +851,8 @@ exports.exportData = async (req, res, next) => {
                         items: [
                             { label: 'Total bill amount', value: totalAmount, format: 'currency', tone: 'warning' },
                             { label: 'Amount paid', value: totalPaid, format: 'currency', tone: 'success' },
+                            { label: 'Paid via cash', value: expenseCashPaid, format: 'currency', tone: 'success' },
+                            { label: 'Paid via UPI', value: expenseUpiPaid, format: 'currency' },
                             { label: 'Pending', value: totalPending, format: 'currency', tone: 'danger' },
                             { label: 'Entries', value: expenses.length, format: 'number' },
                             ...(truncated
@@ -488,13 +873,34 @@ exports.exportData = async (req, res, next) => {
                             'Bill (₹)',
                             'Paid (₹)',
                             'Pending (₹)',
+                            'Method',
                             'Status',
                             'Paid by',
                             'Date',
                         ],
                         rows: tableRows,
-                        columnFormats: ['text', 'text', 'currency', 'currency', 'currency', 'text', 'text', 'text'],
-                        columnAlign: ['left', 'left', 'right', 'right', 'right', 'left', 'left', 'left'],
+                        columnFormats: [
+                            'text',
+                            'text',
+                            'currency',
+                            'currency',
+                            'currency',
+                            'text',
+                            'text',
+                            'text',
+                            'text',
+                        ],
+                        columnAlign: [
+                            'left',
+                            'left',
+                            'right',
+                            'right',
+                            'right',
+                            'left',
+                            'left',
+                            'left',
+                            'left',
+                        ],
                     },
                 ],
             })

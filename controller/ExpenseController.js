@@ -8,6 +8,11 @@ const { parsePagination, buildPaginatedResponse } = require('../utils/pagination
 const { toLeanExpense, sanitizeExpenseForClient } = require('../utils/expenseDto');
 const { logAudit } = require('../utils/auditLog');
 const { notifyExpenseAdded } = require('../utils/notifyExpense');
+const {
+    collectPublicIdsFromPayments,
+    destroyCloudinaryAssets,
+    publicIdFromUrl,
+} = require('../utils/cloudinaryAssets');
 const User = require('../models/User');
 
 // Helper: uploads multiple screenshots in parallel, returns arrays of URLs and public IDs
@@ -83,16 +88,17 @@ const createExpense = async (req, res, next) => {
         await newExpense.save();
         const populated = await Expense.findById(newExpense._id).populate('paidBy', 'name email');
 
-        const actor = await User.findById(userId).select('name');
-        await logAudit({
-            entityType: 'expense',
-            entityId: newExpense._id,
-            action: 'create',
-            actorId: userId,
-            actorName: actor?.name || '',
-            solutionCardId: solutionCardId,
-            summary: `Expense created: ${name} ₹${amount}`,
-        });
+        User.findById(userId).select('name').lean().then((actor) =>
+            logAudit({
+                entityType: 'expense',
+                entityId: newExpense._id,
+                action: 'create',
+                actorId: userId,
+                actorName: actor?.name || '',
+                solutionCardId: solutionCardId,
+                summary: `Expense created: ${name} ₹${amount}`,
+            }).catch((err) => console.error('Audit log failed:', err.message))
+        );
 
         notifyExpenseAdded({
             expense: newExpense,
@@ -209,10 +215,12 @@ const getExpensesBySolutionCard = async (req, res, next) => {
         const [total, expenses] = await Promise.all([
             Expense.countDocuments(filter),
             Expense.find(filter)
+                .select('-payments.upiScreenshotUrls -payments.upiScreenshotPublicIds')
                 .populate('paidBy', 'name email')
                 .sort({ createdAt: -1 })
                 .skip(skip)
-                .limit(limit),
+                .limit(limit)
+                .lean(),
         ]);
 
         const mapped = includeFull
@@ -322,15 +330,68 @@ const updateExpense = async (req, res, next) => {
         }
 
 
+        const oldPublicIds = collectPublicIdsFromPayments(expense.payments);
+
         if (parsedPayments.length > 0) {
-            parsedPayments.forEach(payment => {
-                if (payment.paymentMethod === 'upi') {
-                    payment.upiScreenshotUrls = parsedExistingScreenshots;
+            const oldPayments = Array.isArray(expense.payments) ? expense.payments : [];
+            const oldPaidSum = oldPayments.reduce(
+                (sum, p) => sum + Number(p.paidAmount || 0),
+                0
+            );
+            const newPaidSum = parsedPayments.reduce(
+                (sum, p) => sum + Number(p.paidAmount || 0),
+                0
+            );
+            const incomingMethod = String(parsedPayments[0]?.paymentMethod || '').toLowerCase();
+
+            // Editing name/category/bill should NOT wipe multi-payment history
+            // (Add Payment creates separate cash/UPI rows with their own paidAt).
+            const preservePaymentHistory =
+                parsedPayments.length === 1 &&
+                oldPayments.length > 1 &&
+                Math.abs(oldPaidSum - newPaidSum) < 0.01;
+
+            if (preservePaymentHistory) {
+                if (incomingMethod === 'upi') {
+                    oldPayments.forEach((payment) => {
+                        if (payment.paymentMethod === 'upi') {
+                            payment.upiScreenshotUrls = parsedExistingScreenshots;
+                            payment.upiScreenshotPublicIds = parsedExistingScreenshots
+                                .map((url) => publicIdFromUrl(url))
+                                .filter(Boolean);
+                        }
+                    });
                 }
-            });
-            expense.payments = parsedPayments;
+                expense.payments = oldPayments;
+            } else {
+                parsedPayments.forEach((payment, idx) => {
+                    if (payment.paymentMethod === 'upi') {
+                        payment.upiScreenshotUrls = parsedExistingScreenshots;
+                        payment.upiScreenshotPublicIds = parsedExistingScreenshots
+                            .map((url) => publicIdFromUrl(url))
+                            .filter(Boolean);
+                    }
+                    if (!payment.paidAt) {
+                        payment.paidAt =
+                            oldPayments[idx]?.paidAt ||
+                            oldPayments[0]?.paidAt ||
+                            new Date();
+                    }
+                    if (
+                        payment.paymentMethod !== 'upi' &&
+                        !Array.isArray(payment.upiScreenshotUrls)
+                    ) {
+                        payment.upiScreenshotUrls = [];
+                        payment.upiScreenshotPublicIds = [];
+                    }
+                });
+                expense.payments = parsedPayments;
+            }
         } else if (parsedExistingScreenshots.length > 0 && expense.payments.length > 0) {
             expense.payments[0].upiScreenshotUrls = parsedExistingScreenshots;
+            expense.payments[0].upiScreenshotPublicIds = parsedExistingScreenshots
+                .map((url) => publicIdFromUrl(url))
+                .filter(Boolean);
         }
 
         if (req.files && req.files.length > 0) {
@@ -348,6 +409,17 @@ const updateExpense = async (req, res, next) => {
         }
 
         await expense.save();
+
+        const keptPublicIds = new Set(collectPublicIdsFromPayments(expense.payments));
+        const removedPublicIds = oldPublicIds.filter((id) => !keptPublicIds.has(id));
+        if (removedPublicIds.length) {
+            destroyCloudinaryAssets(removedPublicIds).then(({ failed }) => {
+                failed.forEach((f) =>
+                    console.error(`Cloudinary cleanup failed for ${f.publicId}:`, f.error)
+                );
+            });
+        }
+
         const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
         res.json({
             message: 'Expense updated successfully.',
@@ -380,24 +452,29 @@ const deleteExpense = async (req, res, next) => {
             throw new BadRequestError('You do not have permission to delete this expense.');
         }
 
-        const publicIds = [];
-        for (const payment of expense.payments) {
-            if (Array.isArray(payment.upiScreenshotPublicIds)) {
-                publicIds.push(...payment.upiScreenshotPublicIds.filter(Boolean));
-            }
-        }
+        const publicIds = collectPublicIdsFromPayments(expense.payments);
+
+        // Remove DB record first so UI is not blocked; then clean Cloudinary.
+        await expense.deleteOne();
+
         if (publicIds.length) {
-            await Promise.all(
-                publicIds.map((publicId) =>
-                    cloudinary.uploader.destroy(publicId).catch((err) => {
-                        console.error(`Cloudinary destroy failed for ${publicId}:`, err.message);
-                    })
-                )
+            const { deleted, failed } = await destroyCloudinaryAssets(publicIds);
+            if (failed.length) {
+                failed.forEach((f) =>
+                    console.error(`Cloudinary destroy failed for ${f.publicId}:`, f.error)
+                );
+            }
+            console.log(
+                `Expense ${id}: removed ${deleted.length} Cloudinary asset(s)` +
+                    (failed.length ? `, ${failed.length} failed` : '')
             );
         }
 
-        await expense.deleteOne();
-        res.json({ message: 'Expense deleted successfully.', accessLevel });
+        res.json({
+            message: 'Expense deleted successfully.',
+            accessLevel,
+            cloudinaryDeleted: publicIds.length,
+        });
     } catch (error) {
         next(error);
     }

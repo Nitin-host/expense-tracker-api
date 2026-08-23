@@ -4,13 +4,21 @@ const { parsePagination, buildPaginatedResponse } = require('../utils/pagination
 
 exports.createCollectedCash = async (req, res, next) => {
     try {
-        const { solutionCardId, name, amount } = req.body;
+        const { solutionCardId, name, amount, paymentMethod } = req.body;
         const userId = req.user.userId;
 
         if (!solutionCardId || !name || !amount) {
             return res.status(400).json({
                 success: false,
                 error: { code: 'BAD_REQUEST', message: 'solutionCardId, name, and amount are required.' },
+            });
+        }
+
+        const method = String(paymentMethod || 'cash').toLowerCase();
+        if (!['cash', 'upi'].includes(method)) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'BAD_REQUEST', message: 'paymentMethod must be cash or upi.' },
             });
         }
 
@@ -26,6 +34,7 @@ exports.createCollectedCash = async (req, res, next) => {
             solutionCardId,
             name,
             amount,
+            paymentMethod: method,
             user: userId,
         });
 
@@ -60,7 +69,11 @@ exports.getCollectedCashBySolution = async (req, res, next) => {
 
         const [total, collectedCash] = await Promise.all([
             CollectedCash.countDocuments(filter),
-            CollectedCash.find(filter).sort({ collectedDate: -1 }).skip(skip).limit(limit),
+            CollectedCash.find(filter)
+                .sort({ collectedDate: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
         ]);
 
         res.json(
@@ -80,7 +93,7 @@ exports.getCollectedCashBySolution = async (req, res, next) => {
 exports.updateCollectedCash = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { name, amount } = req.body;
+        const { name, amount, paymentMethod } = req.body;
         const userId = req.user.userId;
 
         const { role: accessLevel } = await checkPermission({
@@ -91,11 +104,19 @@ exports.updateCollectedCash = async (req, res, next) => {
             allowOwner: true,
         });
 
-        const updated = await CollectedCash.findByIdAndUpdate(
-            id,
-            { name, amount, user: userId },
-            { new: true }
-        );
+        const update = { name, amount, user: userId };
+        if (paymentMethod !== undefined) {
+            const method = String(paymentMethod).toLowerCase();
+            if (!['cash', 'upi'].includes(method)) {
+                return res.status(400).json({
+                    success: false,
+                    error: { code: 'BAD_REQUEST', message: 'paymentMethod must be cash or upi.' },
+                });
+            }
+            update.paymentMethod = method;
+        }
+
+        const updated = await CollectedCash.findByIdAndUpdate(id, update, { new: true });
 
         if (!updated) {
             return res.status(404).json({

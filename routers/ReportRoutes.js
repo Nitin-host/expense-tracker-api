@@ -6,6 +6,7 @@ const reportController = require('../controller/ReportController');
 
 router.use(authenticateToken);
 
+router.get('/:solutionCardId/daily', asyncHandler(reportController.getDailyReport));
 router.get('/:solutionCardId/export', asyncHandler(reportController.exportData));
 router.get('/:solutionCardId', asyncHandler(reportController.getReports));
 
