@@ -118,6 +118,9 @@ connectToDatabase()
         console.log('MongoDB connected');
         const emailDiag = getEmailDiagnostics();
         console.log(`[Email] transport=${emailDiag.transport} sender=${emailDiag.sender}`);
+        if (emailDiag.smtpFallbackAvailable) {
+            console.log('[Email] SMTP fallback enabled if Brevo API blocks server IP');
+        }
         if (emailDiag.freeSenderWarning) {
             console.warn(
                 '[Email] WARNING: EMAIL_FROM uses a free provider (@gmail.com etc). ' +

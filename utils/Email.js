@@ -20,11 +20,15 @@ function isFreeEmailDomain(email) {
 
 function getEmailDiagnostics() {
     const apiKey = getApiKey();
+    const smtpReady = Boolean(SMTP_USER && SMTP_KEY);
     return {
         transport: apiKey ? 'brevo-api' : 'brevo-smtp',
+        smtpFallbackAvailable: Boolean(apiKey && smtpReady),
         sender: SENDER_EMAIL,
         senderName: SENDER_NAME,
         freeSenderWarning: isFreeEmailDomain(SENDER_EMAIL),
+        brevoApiKeySet: Boolean(apiKey),
+        brevoSmtpConfigured: smtpReady,
     };
 }
 
@@ -89,9 +93,11 @@ async function sendViaBrevoApi(to, subject, html, textContent) {
     if (!response.ok) {
         const detail = body?.message || body?.code || response.statusText;
         if (response.status === 401 && /IP address/i.test(detail)) {
-            throw new BadRequestError(
+            const ipError = new BadRequestError(
                 'Brevo blocked this server IP. Add your IP in Brevo → Security → Authorized IPs: https://app.brevo.com/security/authorised_ips'
             );
+            ipError.code = 'BREVO_IP_BLOCKED';
+            throw ipError;
         }
         throw new BadRequestError(`Brevo API error (${response.status}): ${detail}`);
     }
@@ -137,7 +143,20 @@ async function sendViaSmtp(to, subject, html, textContent) {
 const sendEmail = async (to, subject, html, textContent = '') => {
     const apiKey = getApiKey();
     if (apiKey) {
-        return sendViaBrevoApi(to, subject, html, textContent);
+        try {
+            return await sendViaBrevoApi(to, subject, html, textContent);
+        } catch (err) {
+            const ipBlocked =
+                err.code === 'BREVO_IP_BLOCKED' ||
+                /blocked this server IP|IP address/i.test(err.message || '');
+            const canUseSmtp = SMTP_USER && SMTP_KEY;
+
+            if (ipBlocked && canUseSmtp) {
+                console.warn('[Email] Brevo API blocked server IP — falling back to SMTP relay');
+                return sendViaSmtp(to, subject, html, textContent);
+            }
+            throw err;
+        }
     }
     return sendViaSmtp(to, subject, html, textContent);
 };
