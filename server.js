@@ -137,6 +137,18 @@ connectToDatabase()
                     'Verify sender in Brevo or use a custom domain for reliable delivery.'
             );
         }
+        const frontendBase = (process.env.FRONTEND_BASE_URL || '').trim();
+        if (!frontendBase) {
+            console.warn(
+                '[Email] WARNING: FRONTEND_BASE_URL is not set — links in share/welcome/OTP emails will be broken.'
+            );
+        } else if (/localhost|127\.0\.0\.1/i.test(frontendBase) && process.env.NODE_ENV === 'production') {
+            console.warn(
+                `[Email] WARNING: FRONTEND_BASE_URL is "${frontendBase}" in production — email links will point to localhost.`
+            );
+        } else {
+            console.log(`[Email] FRONTEND_BASE_URL=${frontendBase}`);
+        }
         app.listen(PORT, () => {
             console.log(`Server is running on port ${PORT}`);
         });

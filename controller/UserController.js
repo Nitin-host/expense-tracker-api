@@ -298,19 +298,6 @@ const createUserBySuperAdmin = async (req, res, next) => {
         const hashedTempPassword = await bcrypt.hash(tempPassword, 10);
         const tempPasswordExpiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
 
-        const { html, text } = await buildUserWelcomeEmail({
-            name,
-            tempPassword,
-            email: normalizedEmail,
-        });
-
-        const messageId = await sendEmail(
-            normalizedEmail,
-            'Your Account Created - Expense Tracker',
-            html,
-            text
-        );
-
         const newUser = new User({
             name,
             email: normalizedEmail,
@@ -324,12 +311,32 @@ const createUserBySuperAdmin = async (req, res, next) => {
 
         await newUser.save();
 
-        res.status(201).json({
-            message: `User created. Welcome email sent to ${normalizedEmail}.`,
-            emailSent: true,
-            messageId,
-            userId: newUser._id,
-        });
+        try {
+            const { html, text } = await buildUserWelcomeEmail({
+                name,
+                tempPassword,
+                email: normalizedEmail,
+                purpose: 'welcome',
+            });
+
+            const messageId = await sendEmail(
+                normalizedEmail,
+                'Your Account Created - Expense Tracker',
+                html,
+                text
+            );
+
+            res.status(201).json({
+                message: `User created. Welcome email sent to ${normalizedEmail}.`,
+                emailSent: true,
+                messageId,
+                userId: newUser._id,
+            });
+        } catch (emailErr) {
+            await User.deleteOne({ _id: newUser._id });
+            console.error('[Email] Welcome email failed; rolled back user create:', emailErr.message);
+            throw emailErr;
+        }
     } catch (error) {
         next(error);
     }
@@ -389,8 +396,10 @@ const requestTempPassword = async (req, res, next) => {
             name: user.name,
             tempPassword,
             email: normalizedEmail,
+            purpose: 'reset',
         });
 
+        // Email first so a send failure does not leave an unused temp password on the account
         await sendEmail(normalizedEmail, 'Reset your Password - Expense Tracker', html, text);
 
         user.password = hashedTempPassword;

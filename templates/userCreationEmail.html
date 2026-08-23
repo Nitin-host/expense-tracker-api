@@ -68,13 +68,12 @@
     <div class="container">
         <div class="header">
             <h2>Expense Tracker</h2>
-            <p>Welcome to the team</p>
+            <p>{{headline}}</p>
         </div>
         <div class="content">
             Hi <b>{{name}}</b>,<br /><br />
-            Your account has been created by the Expense Tracker team.<br />
-            Use the temporary password below to sign in. You <b>must</b> change your password within <b>2 days</b> to keep your
-            account active.
+            {{intro}}<br />
+            {{mustChange}}
         </div>
         <div class="password-box">
             Temporary password:<br />

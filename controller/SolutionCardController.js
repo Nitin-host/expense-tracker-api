@@ -7,6 +7,12 @@ const { buildSolutionSharedEmail } = require('../utils/emailTemplate');
 const { parsePagination, buildPaginatedResponse } = require('../utils/pagination');
 require('dotenv').config();
 
+function normalizeUserId(value) {
+    if (value == null) return null;
+    if (typeof value === 'object' && value._id != null) return String(value._id);
+    return String(value);
+}
+
 // Helper: check if user has access, returns role or null
 const getUserRoleOnCard = (solutionCard, userId) => {
     if (solutionCard.owner.equals(userId)) return 'owner';
@@ -189,7 +195,7 @@ const updateSolutionCard = async (req, res, next) => {
 const shareSolutionCard = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { sharedWith, notifyUsers } = req.body;
+        const { sharedWith, notifyUsers, notifyUserIds } = req.body;
         const userId = req.user.userId;
 
         const card = await SolutionCard.findById(id);
@@ -204,7 +210,9 @@ const shareSolutionCard = async (req, res, next) => {
             throw new BadRequestError('sharedWith must be an array');
         }
 
-        const oldSharedUserIds = (card.sharedWith || []).map((u) => u.user.toString());
+        const oldSharedUserIds = new Set(
+            (card.sharedWith || []).map((u) => normalizeUserId(u.user)).filter(Boolean)
+        );
 
         for (const item of sharedWith) {
             if (!item.user || !item.role) {
@@ -215,12 +223,15 @@ const shareSolutionCard = async (req, res, next) => {
             }
         }
 
-        const userIds = [...new Set(sharedWith.map((item) => String(item.user)))];
+        const userIds = [
+            ...new Set(sharedWith.map((item) => normalizeUserId(item.user)).filter(Boolean)),
+        ];
         const users = await User.find({ _id: { $in: userIds } }).select('name email').lean();
         const userMap = Object.fromEntries(users.map((u) => [u._id.toString(), u]));
 
         const enriched = sharedWith.map((item) => {
-            const user = userMap[String(item.user)];
+            const userIdKey = normalizeUserId(item.user);
+            const user = userMap[userIdKey];
             if (!user) throw new NotFoundError(`User ${item.user} not found`);
             return {
                 user: user._id,
@@ -233,37 +244,57 @@ const shareSolutionCard = async (req, res, next) => {
         card.sharedWith = enriched;
         await card.save();
 
+        let emailsSent = 0;
+        const emailErrors = [];
+
         if (notifyUsers) {
             const owner = await User.findById(userId).select('name').lean();
-            const newUsers = enriched.filter((u) => !oldSharedUserIds.includes(u.user.toString()));
+            const explicitNotifyIds = new Set(
+                (Array.isArray(notifyUserIds) ? notifyUserIds : [])
+                    .map(normalizeUserId)
+                    .filter(Boolean)
+            );
 
-            if (newUsers.length > 0) {
-                // Respond first; send share emails in background
-                setImmediate(() => {
-                    Promise.all(
-                        newUsers.map(async (user) => {
-                            const { html, text } = await buildSolutionSharedEmail({
-                                name: user.name,
-                                ownerName: owner?.name || 'Someone',
-                                role: user.role,
-                                solutionName: card.name,
-                                solutionId: card._id.toString(),
-                            });
-                            await sendEmail(
-                                user.email,
-                                `Solution "${card.name}" shared with you`,
-                                html,
-                                text
-                            );
-                        })
-                    ).catch((err) => console.error('Share notification email failed:', err.message));
-                });
-            }
+            const toNotify = enriched.filter((u) => {
+                const id = normalizeUserId(u.user);
+                return !oldSharedUserIds.has(id) || explicitNotifyIds.has(id);
+            });
+
+            const results = await Promise.allSettled(
+                toNotify.map(async (user) => {
+                    const { html, text } = await buildSolutionSharedEmail({
+                        name: user.name,
+                        ownerName: owner?.name || 'Someone',
+                        role: user.role,
+                        solutionName: card.name,
+                        solutionId: card._id.toString(),
+                    });
+                    return sendEmail(
+                        user.email,
+                        `Solution "${card.name}" shared with you`,
+                        html,
+                        text
+                    );
+                })
+            );
+
+            results.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                    emailsSent += 1;
+                    return;
+                }
+                const failedUser = toNotify[index];
+                const message = result.reason?.message || 'Unknown email error';
+                console.error(`Share notification email failed for ${failedUser?.email}:`, message);
+                emailErrors.push({ email: failedUser?.email, error: message });
+            });
         }
 
         res.json({
             message: 'Solution sharing updated successfully',
             sharedWith: card.sharedWith,
+            emailsSent,
+            ...(emailErrors.length ? { emailErrors } : {}),
         });
         return;
     } catch (error) {
