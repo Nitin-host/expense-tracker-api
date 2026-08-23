@@ -117,7 +117,16 @@ connectToDatabase()
     .then(() => {
         console.log('MongoDB connected');
         const emailDiag = getEmailDiagnostics();
-        console.log(`[Email] transport=${emailDiag.transport} sender=${emailDiag.sender}`);
+        console.log(`[Email] transport=${emailDiag.transport} sender=${emailDiag.sender} smtpLogin=${emailDiag.smtpLogin || 'n/a'}`);
+        if (emailDiag.invalidFromConfig) {
+            console.warn(
+                '[Email] WARNING: EMAIL_FROM must not be @smtp-brevo.com. ' +
+                    'Use a verified sender; keep @smtp-brevo.com as BREVO_SMTP_USER only.'
+            );
+        }
+        if (!emailDiag.sender) {
+            console.warn('[Email] WARNING: No valid EMAIL_FROM configured — outbound email will fail.');
+        }
         if (emailDiag.smtpFallbackAvailable) {
             console.log('[Email] SMTP fallback enabled if Brevo API blocks server IP');
         }

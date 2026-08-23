@@ -6,8 +6,32 @@ const SMTP_HOST = process.env.BREVO_SMTP_HOST || 'smtp-relay.brevo.com';
 const SMTP_PORT = Number(process.env.BREVO_SMTP_PORT) || 587;
 const SMTP_USER = process.env.BREVO_SMTP_USER || process.env.EMAIL_USER;
 const SMTP_KEY = process.env.BREVO_SMTP_KEY?.trim();
-const SENDER_EMAIL = process.env.EMAIL_FROM || process.env.BREVO_SENDER_EMAIL || SMTP_USER;
 const SENDER_NAME = process.env.EMAIL_FROM_NAME || 'Expense Tracker';
+
+/** @smtp-brevo.com is SMTP login only — never valid as From address */
+function isBrevoSmtpLoginEmail(email) {
+    return /@smtp-brevo\.com$/i.test(String(email || '').trim());
+}
+
+function resolveSenderEmail() {
+    const candidates = [
+        process.env.EMAIL_FROM,
+        process.env.BREVO_SENDER_EMAIL,
+        process.env.BREVO_SMTP_USER,
+        process.env.EMAIL_USER,
+    ];
+
+    for (const value of candidates) {
+        const email = String(value || '').trim();
+        if (email && !isBrevoSmtpLoginEmail(email)) {
+            return email;
+        }
+    }
+
+    return null;
+}
+
+const SENDER_EMAIL = resolveSenderEmail();
 
 function getApiKey() {
     return process.env.BREVO_API_KEY?.trim() || null;
@@ -21,15 +45,26 @@ function isFreeEmailDomain(email) {
 function getEmailDiagnostics() {
     const apiKey = getApiKey();
     const smtpReady = Boolean(SMTP_USER && SMTP_KEY);
+    const invalidSmtpLoginAsFrom = isBrevoSmtpLoginEmail(process.env.EMAIL_FROM);
     return {
         transport: apiKey ? 'brevo-api' : 'brevo-smtp',
         smtpFallbackAvailable: Boolean(apiKey && smtpReady),
         sender: SENDER_EMAIL,
         senderName: SENDER_NAME,
+        smtpLogin: SMTP_USER,
         freeSenderWarning: isFreeEmailDomain(SENDER_EMAIL),
+        invalidFromConfig: invalidSmtpLoginAsFrom,
         brevoApiKeySet: Boolean(apiKey),
         brevoSmtpConfigured: smtpReady,
     };
+}
+
+function assertSenderConfigured() {
+    if (SENDER_EMAIL) return SENDER_EMAIL;
+    throw new BadRequestError(
+        'EMAIL_FROM must be a verified sender in Brevo (Senders & IP). ' +
+            'Do not use @smtp-brevo.com — that address is for SMTP login (BREVO_SMTP_USER) only.'
+    );
 }
 
 function normalizeRecipients(to) {
@@ -65,13 +100,15 @@ async function sendViaBrevoApi(to, subject, html, textContent) {
         throw new BadRequestError('BREVO_API_KEY is not set');
     }
 
+    const senderEmail = assertSenderConfigured();
+
     const recipients = normalizeRecipients(to).map((email) => ({ email }));
     if (!recipients.length) {
         throw new BadRequestError('No valid recipient email provided');
     }
 
     const payload = {
-        sender: { name: SENDER_NAME, email: SENDER_EMAIL },
+        sender: { name: SENDER_NAME, email: senderEmail },
         to: recipients,
         subject,
         htmlContent: html,
@@ -99,6 +136,12 @@ async function sendViaBrevoApi(to, subject, html, textContent) {
             ipError.code = 'BREVO_IP_BLOCKED';
             throw ipError;
         }
+        if (/sender.*not valid|validate your sender|authenticate your domain/i.test(detail)) {
+            throw new BadRequestError(
+                `Brevo rejected sender "${senderEmail}". Verify it under Brevo → Senders & IP → Senders. ` +
+                    'Use EMAIL_FROM for the verified address; keep BREVO_SMTP_USER as your @smtp-brevo.com login.'
+            );
+        }
         throw new BadRequestError(`Brevo API error (${response.status}): ${detail}`);
     }
 
@@ -112,11 +155,12 @@ async function sendViaBrevoApi(to, subject, html, textContent) {
 
 async function sendViaSmtp(to, subject, html, textContent) {
     const transport = getTransporter();
+    const senderEmail = assertSenderConfigured();
     const recipients = normalizeRecipients(to).join(', ');
 
     try {
         const info = await transport.sendMail({
-            from: `"${SENDER_NAME}" <${SENDER_EMAIL}>`,
+            from: `"${SENDER_NAME}" <${senderEmail}>`,
             to: recipients,
             subject,
             html,
