@@ -16,6 +16,13 @@ const reportRouter = require('./routers/ReportRoutes');
 const cookieParser = require('cookie-parser');
 
 const app = express();
+
+// Render/Heroku/Netlify proxies set X-Forwarded-For; required for express-rate-limit
+if (process.env.TRUST_PROXY !== 'false') {
+    const hops = process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) : 1;
+    app.set('trust proxy', Number.isFinite(hops) && hops > 0 ? hops : 1);
+}
+
 app.use(cookieParser());
 app.use(compression());
 
