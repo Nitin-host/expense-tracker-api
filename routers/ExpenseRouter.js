@@ -34,6 +34,17 @@ router.post(
     asyncHandler(expenseController.addPayment)
 );
 
+router.put(
+    '/:expenseId/payments/:paymentIndex',
+    upload.array('upiScreenshots', 5),
+    asyncHandler(expenseController.updatePayment)
+);
+
+router.delete(
+    '/:expenseId/payments/:paymentIndex',
+    asyncHandler(expenseController.removePayment)
+);
+
 router.get(
     '/solution-card/:solutionCardId',
     asyncHandler(expenseController.getExpensesBySolutionCard)

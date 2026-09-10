@@ -6,7 +6,7 @@ const paymentSchema = new mongoose.Schema({
     paymentMethod: { type: String, enum: ['cash', 'upi'], required: true },
     upiScreenshotUrls: [{ type: String }],         // Array of Cloudinary URLs
     upiScreenshotPublicIds: [{ type: String }],    // Array of Cloudinary public IDs
-}, { _id: false });
+}); // subdocument _id enabled so installments can be targeted safely later
 
 const expenseSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true },      // Who is adding

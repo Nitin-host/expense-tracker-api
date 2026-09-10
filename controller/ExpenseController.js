@@ -218,6 +218,244 @@ const addPayment = async (req, res, next) => {
     }
 };
 
+function parsePaymentIndex(raw) {
+    const index = Number.parseInt(raw, 10);
+    if (!Number.isInteger(index) || index < 0) {
+        throw new BadRequestError('Invalid payment index.');
+    }
+    return index;
+}
+
+/**
+ * Remove one installment from expense payment history.
+ * Deletes the payment from MongoDB and destroys its UPI screenshots on Cloudinary.
+ */
+const removePayment = async (req, res, next) => {
+    try {
+        const userId = req.user.userId;
+        const { expenseId, paymentIndex } = req.params;
+        const index = parsePaymentIndex(paymentIndex);
+
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: expenseId,
+            userId,
+            allowedRoles: ['editor'],
+            allowOwner: true,
+        });
+
+        if (!Array.isArray(expense.payments) || index >= expense.payments.length) {
+            throw new BadRequestError('Payment installment not found.');
+        }
+
+        // Optional fingerprint guards against stale UI after concurrent edits
+        const expectedAmount = req.body?.paidAmount ?? req.query?.paidAmount;
+        const target = expense.payments[index];
+        if (
+            expectedAmount != null &&
+            expectedAmount !== '' &&
+            Math.abs(roundMoney(expectedAmount) - roundMoney(target.paidAmount)) > MONEY_EPS
+        ) {
+            throw new BadRequestError(
+                'This payment was changed by someone else. Refresh history and try again.'
+            );
+        }
+
+        // Snapshot plain payment data before splice (incl. screenshot URLs / publicIds)
+        const removedPlain =
+            typeof target.toObject === 'function' ? target.toObject() : { ...target };
+        const removedPublicIds = collectPublicIdsFromPayments([removedPlain]);
+
+        expense.payments.splice(index, 1);
+        expense.markModified('payments');
+        await expense.save();
+
+        // DB is already updated — cleanup Cloudinary in background so mobile clients
+        // are not blocked waiting on remote image deletes.
+        if (removedPublicIds.length) {
+            destroyCloudinaryAssets(removedPublicIds)
+                .then(({ deleted, failed }) => {
+                    failed.forEach((f) =>
+                        console.error(`Cloudinary cleanup failed for ${f.publicId}:`, f.error)
+                    );
+                    console.log(
+                        `Payment remove on expense ${expenseId}: Cloudinary deleted=${deleted.length}` +
+                            (failed.length ? `, failed=${failed.length}` : '')
+                    );
+                })
+                .catch((err) =>
+                    console.error('Cloudinary cleanup error after payment remove:', err.message)
+                );
+        }
+
+        User.findById(userId).select('name').lean().then((actor) =>
+            logAudit({
+                entityType: 'expense',
+                entityId: expense._id,
+                action: 'payment_remove',
+                actorId: userId,
+                actorName: actor?.name || '',
+                solutionCardId: expense.solutionCard?._id || expense.solutionCard,
+                summary: `Removed ${String(removedPlain.paymentMethod || '').toUpperCase()} payment ₹${roundMoney(removedPlain.paidAmount)} from ${expense.name}`,
+            }).catch((err) => console.error('Audit log failed:', err.message))
+        );
+
+        const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
+        res.json({
+            message: 'Payment removed successfully.',
+            expense: sanitizeExpenseForClient(populated),
+            accessLevel,
+            storage: {
+                dbRemoved: true,
+                cloudinaryCleanupQueued: removedPublicIds.length,
+            },
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * Edit one installment (amount / method / screenshots) without wiping other history rows.
+ */
+const updatePayment = async (req, res, next) => {
+    try {
+        const userId = req.user.userId;
+        const { expenseId, paymentIndex } = req.params;
+        const index = parsePaymentIndex(paymentIndex);
+        const { paidAmount, paymentMethod, existingScreenshots } = req.body;
+
+        const { resource: expense, role: accessLevel } = await checkPermission({
+            resourceType: 'expense',
+            resourceId: expenseId,
+            userId,
+            allowedRoles: ['editor'],
+            allowOwner: true,
+        });
+
+        if (!Array.isArray(expense.payments) || index >= expense.payments.length) {
+            throw new BadRequestError('Payment installment not found.');
+        }
+
+        const payment = expense.payments[index];
+        const oldPublicIds = collectPublicIdsFromPayments([payment]);
+
+        const nextPaid =
+            paidAmount != null && paidAmount !== ''
+                ? roundMoney(paidAmount)
+                : roundMoney(payment.paidAmount);
+        if (!(nextPaid > 0)) {
+            throw new BadRequestError('Paid amount must be greater than 0.');
+        }
+
+        const nextMethod =
+            paymentMethod != null && paymentMethod !== ''
+                ? assertPaymentMethod(paymentMethod)
+                : assertPaymentMethod(payment.paymentMethod);
+
+        const otherPaid = roundMoney(
+            expense.payments.reduce((sum, p, i) => {
+                if (i === index) return sum;
+                return sum + Number(p.paidAmount || 0);
+            }, 0)
+        );
+        if (otherPaid + nextPaid - roundMoney(expense.amount) > MONEY_EPS) {
+            throw new BadRequestError(
+                'Updated payment would make total paid greater than bill amount.'
+            );
+        }
+
+        let keptUrls = [];
+        if (existingScreenshots) {
+            try {
+                const parsed = JSON.parse(existingScreenshots);
+                keptUrls = Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+            } catch {
+                throw new BadRequestError('Invalid existingScreenshots JSON format.');
+            }
+        } else if (nextMethod === 'upi') {
+            keptUrls = Array.isArray(payment.upiScreenshotUrls)
+                ? payment.upiScreenshotUrls.filter(Boolean)
+                : [];
+        }
+
+        let uploaded = { urls: [], publicIds: [] };
+        if (req.files && req.files.length > 0) {
+            if (nextMethod !== 'upi') {
+                throw new BadRequestError('UPI screenshots can only be attached to UPI payments.');
+            }
+            uploaded = await uploadUPIScreenshots(req.files);
+        }
+
+        if (nextMethod === 'upi') {
+            const urls = [...keptUrls, ...uploaded.urls];
+            if (!urls.length) {
+                throw new BadRequestError('At least one UPI screenshot is required for UPI payments.');
+            }
+            payment.paymentMethod = 'upi';
+            payment.paidAmount = nextPaid;
+            payment.upiScreenshotUrls = urls;
+            payment.upiScreenshotPublicIds = urls
+                .map((url) => publicIdFromUrl(url))
+                .filter(Boolean);
+            // Prefer uploaded publicIds when available
+            if (uploaded.publicIds.length) {
+                const fromKept = keptUrls.map((url) => publicIdFromUrl(url)).filter(Boolean);
+                payment.upiScreenshotPublicIds = [...fromKept, ...uploaded.publicIds];
+            }
+        } else {
+            payment.paymentMethod = 'cash';
+            payment.paidAmount = nextPaid;
+            payment.upiScreenshotUrls = [];
+            payment.upiScreenshotPublicIds = [];
+        }
+
+        if (!payment.paidAt) payment.paidAt = new Date();
+
+        expense.markModified('payments');
+        await expense.save();
+
+        const keptPublicIds = new Set(collectPublicIdsFromPayments([payment]));
+        const removedPublicIds = oldPublicIds.filter((id) => !keptPublicIds.has(id));
+        if (removedPublicIds.length) {
+            destroyCloudinaryAssets(removedPublicIds)
+                .then(({ failed }) => {
+                    failed.forEach((f) =>
+                        console.error(`Cloudinary cleanup failed for ${f.publicId}:`, f.error)
+                    );
+                })
+                .catch((err) =>
+                    console.error('Cloudinary cleanup error after payment update:', err.message)
+                );
+        }
+
+        User.findById(userId).select('name').lean().then((actor) =>
+            logAudit({
+                entityType: 'expense',
+                entityId: expense._id,
+                action: 'payment_update',
+                actorId: userId,
+                actorName: actor?.name || '',
+                solutionCardId: expense.solutionCard?._id || expense.solutionCard,
+                summary: `Updated payment #${index + 1} on ${expense.name} to ₹${nextPaid} ${nextMethod.toUpperCase()}`,
+            }).catch((err) => console.error('Audit log failed:', err.message))
+        );
+
+        const populated = await Expense.findById(expense._id).populate('paidBy', 'name email');
+        res.json({
+            message: 'Payment updated successfully.',
+            expense: sanitizeExpenseForClient(populated),
+            accessLevel,
+            storage: { cloudinaryCleanupQueued: removedPublicIds.length },
+        });
+    } catch (error) {
+        if (req.files && req.files.length) {
+            req.files.forEach((f) => fs.existsSync(f.path) && fs.unlinkSync(f.path));
+        }
+        next(error);
+    }
+};
+
 // Retrieve expenses by solution card (paginated, lean by default)
 const getExpensesBySolutionCard = async (req, res, next) => {
     try {
@@ -635,6 +873,8 @@ const getDeletedExpensesBySolutionCard = async (req, res, next) => {
 module.exports = {
     createExpense,
     addPayment,
+    removePayment,
+    updatePayment,
     getExpensesBySolutionCard,
     getExpenseById,
     updateExpense,
