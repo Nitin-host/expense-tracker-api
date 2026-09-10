@@ -15,6 +15,24 @@ const {
 } = require('../utils/cloudinaryAssets');
 const User = require('../models/User');
 
+const MONEY_EPS = 0.005;
+
+function roundMoney(value) {
+    return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function normalizePaymentMethod(method) {
+    return String(method || '').trim().toLowerCase();
+}
+
+function assertPaymentMethod(method) {
+    const normalized = normalizePaymentMethod(method);
+    if (!['cash', 'upi'].includes(normalized)) {
+        throw new BadRequestError('paymentMethod must be cash or upi.');
+    }
+    return normalized;
+}
+
 // Helper: uploads multiple screenshots in parallel, returns arrays of URLs and public IDs
 async function uploadUPIScreenshots(files) {
     const results = await Promise.all(
@@ -42,10 +60,19 @@ const createExpense = async (req, res, next) => {
         const userId = req.user.userId;
         const { name, category, amount, paymentMethod, paidAmount, solutionCard: solutionCardId } = req.body;
 
-        if (!name || !category || !amount || !paymentMethod || paidAmount == null || !solutionCardId) {
+        if (!name || !category || amount == null || amount === '' || paidAmount == null || paidAmount === '' || !solutionCardId) {
             throw new BadRequestError('Missing required fields.');
         }
-        if (+paidAmount > +amount) {
+
+        const billAmount = roundMoney(amount);
+        const paid = roundMoney(paidAmount);
+        if (!(billAmount > 0)) {
+            throw new BadRequestError('Amount must be greater than 0.');
+        }
+        if (paid < 0) {
+            throw new BadRequestError('Paid amount cannot be negative.');
+        }
+        if (paid - billAmount > MONEY_EPS) {
             throw new BadRequestError('Paid amount cannot be greater than total amount.');
         }
 
@@ -58,29 +85,35 @@ const createExpense = async (req, res, next) => {
             allowOwner: true
         });
 
-        let upiScreenshotData = {};
-        if (paymentMethod === 'upi') {
-            if (!req.files || req.files.length === 0) {
-                throw new BadRequestError('At least one UPI screenshot is required for UPI payments.');
+        const payments = [];
+        if (paid > MONEY_EPS) {
+            const method = assertPaymentMethod(paymentMethod);
+            let upiScreenshotData = {};
+            if (method === 'upi') {
+                if (!req.files || req.files.length === 0) {
+                    throw new BadRequestError('At least one UPI screenshot is required for UPI payments.');
+                }
+                upiScreenshotData = await uploadUPIScreenshots(req.files);
             }
-            upiScreenshotData = await uploadUPIScreenshots(req.files);
-        }
 
-        const paymentObj = {
-            paidAmount: Number(paidAmount),
-            paymentMethod,
-            paidAt: new Date(),
-            ...(paymentMethod === 'upi' ? {
-                upiScreenshotUrls: upiScreenshotData.urls,
-                upiScreenshotPublicIds: upiScreenshotData.publicIds,
-            } : {}),
-        };
+            payments.push({
+                paidAmount: paid,
+                paymentMethod: method,
+                paidAt: new Date(),
+                ...(method === 'upi'
+                    ? {
+                          upiScreenshotUrls: upiScreenshotData.urls,
+                          upiScreenshotPublicIds: upiScreenshotData.publicIds,
+                      }
+                    : { upiScreenshotUrls: [], upiScreenshotPublicIds: [] }),
+            });
+        }
 
         const newExpense = new Expense({
             name,
             category,
-            amount,
-            payments: [paymentObj],
+            amount: billAmount,
+            payments,
             paidBy: userId,
             solutionCard: solutionCardId,
         });
@@ -96,7 +129,7 @@ const createExpense = async (req, res, next) => {
                 actorId: userId,
                 actorName: actor?.name || '',
                 solutionCardId: solutionCardId,
-                summary: `Expense created: ${name} ₹${amount}`,
+                summary: `Expense created: ${name} ₹${billAmount}`,
             }).catch((err) => console.error('Audit log failed:', err.message))
         );
 
@@ -126,8 +159,14 @@ const addPayment = async (req, res, next) => {
         const { expenseId } = req.params;
         const { paidAmount, paymentMethod } = req.body;
 
-        if (!paidAmount || !paymentMethod) {
+        if (paidAmount == null || paidAmount === '' || !paymentMethod) {
             throw new BadRequestError('paidAmount and paymentMethod are required.');
+        }
+
+        const method = assertPaymentMethod(paymentMethod);
+        const paid = roundMoney(paidAmount);
+        if (!(paid > 0)) {
+            throw new BadRequestError('Paid amount must be greater than 0.');
         }
 
         const { resource: expense, role: accessLevel } = await checkPermission({
@@ -138,12 +177,13 @@ const addPayment = async (req, res, next) => {
             allowOwner: true
         });
 
-        if (+paidAmount > expense.amount - expense.advancePaid) {
+        const pending = roundMoney(expense.amount - expense.advancePaid);
+        if (paid - pending > MONEY_EPS) {
             throw new BadRequestError('Paid amount exceeds pending amount.');
         }
 
         let upiScreenshotData = {};
-        if (paymentMethod === 'upi') {
+        if (method === 'upi') {
             if (!req.files || req.files.length === 0) {
                 throw new BadRequestError('At least one UPI screenshot is required for UPI payments.');
             }
@@ -151,13 +191,15 @@ const addPayment = async (req, res, next) => {
         }
 
         const paymentObj = {
-            paidAmount: Number(paidAmount),
-            paymentMethod,
+            paidAmount: paid,
+            paymentMethod: method,
             paidAt: new Date(),
-            ...(paymentMethod === 'upi' ? {
-                upiScreenshotUrls: upiScreenshotData.urls,
-                upiScreenshotPublicIds: upiScreenshotData.publicIds,
-            } : {}),
+            ...(method === 'upi'
+                ? {
+                      upiScreenshotUrls: upiScreenshotData.urls,
+                      upiScreenshotPublicIds: upiScreenshotData.publicIds,
+                  }
+                : { upiScreenshotUrls: [], upiScreenshotPublicIds: [] }),
         };
 
         expense.payments.push(paymentObj);
@@ -202,8 +244,24 @@ const getExpensesBySolutionCard = async (req, res, next) => {
         if (paymentStatus) filter.paymentStatus = paymentStatus;
         if (from || to) {
             filter.createdAt = {};
-            if (from) filter.createdAt.$gte = new Date(from);
-            if (to) filter.createdAt.$lte = new Date(to);
+            if (from) {
+                // YYYY-MM-DD from <input type="date"> → local start of day
+                if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+                    const [y, m, d] = from.split('-').map(Number);
+                    filter.createdAt.$gte = new Date(y, m - 1, d, 0, 0, 0, 0);
+                } else {
+                    filter.createdAt.$gte = new Date(from);
+                }
+            }
+            if (to) {
+                // Inclusive end-of-day so same-day expenses are not dropped
+                if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+                    const [y, m, d] = to.split('-').map(Number);
+                    filter.createdAt.$lte = new Date(y, m - 1, d, 23, 59, 59, 999);
+                } else {
+                    filter.createdAt.$lte = new Date(to);
+                }
+            }
         }
         if (q) {
             filter.$or = [
@@ -215,7 +273,6 @@ const getExpensesBySolutionCard = async (req, res, next) => {
         const [total, expenses] = await Promise.all([
             Expense.countDocuments(filter),
             Expense.find(filter)
-                .select('-payments.upiScreenshotUrls -payments.upiScreenshotPublicIds')
                 .populate('paidBy', 'name email')
                 .sort({ createdAt: -1 })
                 .skip(skip)
@@ -223,6 +280,7 @@ const getExpensesBySolutionCard = async (req, res, next) => {
                 .lean(),
         ]);
 
+        // toLeanExpense strips screenshot URLs/publicIds from the client payload after counting them.
         const mapped = includeFull
             ? expenses.map(sanitizeExpenseForClient)
             : expenses.map(toLeanExpense);
@@ -278,12 +336,17 @@ const updateExpense = async (req, res, next) => {
 
         const { name, category, amount, payments, existingScreenshots } = req.body;
 
-        let parsedPayments = [];
-        if (payments) {
+        let parsedPayments = null;
+        if (payments !== undefined && payments !== null && payments !== '') {
             try {
                 parsedPayments = JSON.parse(payments);
+                if (!Array.isArray(parsedPayments)) {
+                    throw new Error('not array');
+                }
             } catch {
-                return res.status(400).json({ message: 'Invalid payments JSON format' });
+                return res.status(400).json({
+                    error: { code: 'BAD_REQUEST', message: 'Invalid payments JSON format' },
+                });
             }
         }
 
@@ -292,7 +355,9 @@ const updateExpense = async (req, res, next) => {
             try {
                 parsedExistingScreenshots = JSON.parse(existingScreenshots);
             } catch {
-                return res.status(400).json({ message: 'Invalid existingScreenshots JSON format' });
+                return res.status(400).json({
+                    error: { code: 'BAD_REQUEST', message: 'Invalid existingScreenshots JSON format' },
+                });
             }
         }
 
@@ -300,92 +365,95 @@ const updateExpense = async (req, res, next) => {
         if (category !== undefined) expense.category = category;
 
         if (amount !== undefined) {
-            const numericAmount = Number(amount);
-            let newAdvancePaid = expense.advancePaid;
-            if (parsedPayments.length > 0) {
-                newAdvancePaid = parsedPayments.reduce(
-                    (sum, p) => sum + Number(p.paidAmount || 0),
-                    0
+            const numericAmount = roundMoney(amount);
+            if (!(numericAmount > 0)) {
+                throw new BadRequestError('Amount must be greater than 0.');
+            }
+            let newAdvancePaid = roundMoney(expense.advancePaid);
+            if (Array.isArray(parsedPayments)) {
+                newAdvancePaid = roundMoney(
+                    parsedPayments.reduce((sum, p) => sum + Number(p.paidAmount || 0), 0)
                 );
             }
-            if (newAdvancePaid > numericAmount) {
+            if (newAdvancePaid - numericAmount > MONEY_EPS) {
                 throw new BadRequestError('Paid amount cannot be greater than total amount.');
             }
 
             expense.amount = numericAmount;
             expense.advancePaid = newAdvancePaid;
-        } else {
-            if (parsedPayments.length > 0) {
-                const newAdvancePaid = parsedPayments.reduce(
-                    (sum, p) => sum + Number(p.paidAmount || 0),
-                    0
-                );
+        } else if (Array.isArray(parsedPayments)) {
+            const newAdvancePaid = roundMoney(
+                parsedPayments.reduce((sum, p) => sum + Number(p.paidAmount || 0), 0)
+            );
 
-                if (newAdvancePaid > expense.amount) {
-                    throw new BadRequestError('Paid amount cannot be greater than total amount.');
-                }
-
-                expense.advancePaid = newAdvancePaid;
+            if (newAdvancePaid - roundMoney(expense.amount) > MONEY_EPS) {
+                throw new BadRequestError('Paid amount cannot be greater than total amount.');
             }
+
+            expense.advancePaid = newAdvancePaid;
         }
 
 
         const oldPublicIds = collectPublicIdsFromPayments(expense.payments);
 
-        if (parsedPayments.length > 0) {
-            const oldPayments = Array.isArray(expense.payments) ? expense.payments : [];
-            const oldPaidSum = oldPayments.reduce(
-                (sum, p) => sum + Number(p.paidAmount || 0),
-                0
-            );
-            const newPaidSum = parsedPayments.reduce(
-                (sum, p) => sum + Number(p.paidAmount || 0),
-                0
-            );
-            const incomingMethod = String(parsedPayments[0]?.paymentMethod || '').toLowerCase();
+        if (Array.isArray(parsedPayments)) {
+            if (parsedPayments.length === 0) {
+                expense.payments = [];
+            } else {
+                const oldPayments = Array.isArray(expense.payments) ? expense.payments : [];
+                const oldPaidSum = roundMoney(
+                    oldPayments.reduce((sum, p) => sum + Number(p.paidAmount || 0), 0)
+                );
+                const newPaidSum = roundMoney(
+                    parsedPayments.reduce((sum, p) => sum + Number(p.paidAmount || 0), 0)
+                );
 
-            // Editing name/category/bill should NOT wipe multi-payment history
-            // (Add Payment creates separate cash/UPI rows with their own paidAt).
-            const preservePaymentHistory =
-                parsedPayments.length === 1 &&
-                oldPayments.length > 1 &&
-                Math.abs(oldPaidSum - newPaidSum) < 0.01;
+                // Editing name/category/bill should NOT wipe multi-payment history
+                // (Add Payment creates separate cash/UPI rows with their own paidAt).
+                const preservePaymentHistory =
+                    parsedPayments.length === 1 &&
+                    oldPayments.length > 1 &&
+                    Math.abs(oldPaidSum - newPaidSum) < MONEY_EPS;
 
-            if (preservePaymentHistory) {
-                if (incomingMethod === 'upi') {
-                    oldPayments.forEach((payment) => {
+                if (preservePaymentHistory) {
+                    // Keep installment rows as-is; only bill metadata was edited.
+                    expense.payments = oldPayments;
+                } else {
+                    parsedPayments.forEach((payment, idx) => {
+                        payment.paymentMethod = assertPaymentMethod(payment.paymentMethod);
+                        payment.paidAmount = roundMoney(payment.paidAmount);
+                        if (payment.paidAmount < 0) {
+                            throw new BadRequestError('Paid amount cannot be negative.');
+                        }
+
                         if (payment.paymentMethod === 'upi') {
-                            payment.upiScreenshotUrls = parsedExistingScreenshots;
-                            payment.upiScreenshotPublicIds = parsedExistingScreenshots
+                            const ownUrls = Array.isArray(payment.upiScreenshotUrls)
+                                ? payment.upiScreenshotUrls.filter(Boolean)
+                                : [];
+                            // Prefer each payment's own screenshots (multi-payment history).
+                            // Fall back to shared existingScreenshots only for single-payment edits.
+                            payment.upiScreenshotUrls =
+                                ownUrls.length > 0
+                                    ? ownUrls
+                                    : parsedPayments.length === 1
+                                      ? parsedExistingScreenshots
+                                      : ownUrls;
+                            payment.upiScreenshotPublicIds = (payment.upiScreenshotUrls || [])
                                 .map((url) => publicIdFromUrl(url))
                                 .filter(Boolean);
+                        } else {
+                            payment.upiScreenshotUrls = [];
+                            payment.upiScreenshotPublicIds = [];
+                        }
+                        if (!payment.paidAt) {
+                            payment.paidAt =
+                                oldPayments[idx]?.paidAt ||
+                                oldPayments[0]?.paidAt ||
+                                new Date();
                         }
                     });
+                    expense.payments = parsedPayments;
                 }
-                expense.payments = oldPayments;
-            } else {
-                parsedPayments.forEach((payment, idx) => {
-                    if (payment.paymentMethod === 'upi') {
-                        payment.upiScreenshotUrls = parsedExistingScreenshots;
-                        payment.upiScreenshotPublicIds = parsedExistingScreenshots
-                            .map((url) => publicIdFromUrl(url))
-                            .filter(Boolean);
-                    }
-                    if (!payment.paidAt) {
-                        payment.paidAt =
-                            oldPayments[idx]?.paidAt ||
-                            oldPayments[0]?.paidAt ||
-                            new Date();
-                    }
-                    if (
-                        payment.paymentMethod !== 'upi' &&
-                        !Array.isArray(payment.upiScreenshotUrls)
-                    ) {
-                        payment.upiScreenshotUrls = [];
-                        payment.upiScreenshotPublicIds = [];
-                    }
-                });
-                expense.payments = parsedPayments;
             }
         } else if (parsedExistingScreenshots.length > 0 && expense.payments.length > 0) {
             expense.payments[0].upiScreenshotUrls = parsedExistingScreenshots;
@@ -396,15 +464,29 @@ const updateExpense = async (req, res, next) => {
 
         if (req.files && req.files.length > 0) {
             const uploaded = await uploadUPIScreenshots(req.files);
-            if (expense.payments.length > 0) {
-                expense.payments[0].upiScreenshotUrls = [
-                    ...(expense.payments[0].upiScreenshotUrls || []),
-                    ...uploaded.urls,
-                ];
-                expense.payments[0].upiScreenshotPublicIds = [
-                    ...(expense.payments[0].upiScreenshotPublicIds || []),
-                    ...uploaded.publicIds,
-                ];
+            const target =
+                expense.payments.find((p) => p.paymentMethod === 'upi') || expense.payments[0];
+            if (!target || target.paymentMethod !== 'upi') {
+                throw new BadRequestError('UPI screenshots can only be attached to UPI payments.');
+            }
+            target.upiScreenshotUrls = [
+                ...(target.upiScreenshotUrls || []),
+                ...uploaded.urls,
+            ];
+            target.upiScreenshotPublicIds = [
+                ...(target.upiScreenshotPublicIds || []),
+                ...uploaded.publicIds,
+            ];
+        }
+
+        // Every UPI installment must keep at least one screenshot
+        for (const payment of expense.payments) {
+            if (
+                payment.paymentMethod === 'upi' &&
+                Number(payment.paidAmount) > MONEY_EPS &&
+                !(payment.upiScreenshotUrls && payment.upiScreenshotUrls.length)
+            ) {
+                throw new BadRequestError('At least one UPI screenshot is required for UPI payments.');
             }
         }
 

@@ -7,10 +7,18 @@ exports.createCollectedCash = async (req, res, next) => {
         const { solutionCardId, name, amount, paymentMethod } = req.body;
         const userId = req.user.userId;
 
-        if (!solutionCardId || !name || !amount) {
+        if (!solutionCardId || !name || amount == null || amount === '') {
             return res.status(400).json({
                 success: false,
                 error: { code: 'BAD_REQUEST', message: 'solutionCardId, name, and amount are required.' },
+            });
+        }
+
+        const numericAmount = Number(amount);
+        if (!(numericAmount > 0)) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'BAD_REQUEST', message: 'Amount must be greater than 0.' },
             });
         }
 
@@ -33,7 +41,7 @@ exports.createCollectedCash = async (req, res, next) => {
         const collectedCash = await CollectedCash.create({
             solutionCardId,
             name,
-            amount,
+            amount: numericAmount,
             paymentMethod: method,
             user: userId,
         });
@@ -63,8 +71,22 @@ exports.getCollectedCashBySolution = async (req, res, next) => {
         if (q) filter.name = { $regex: q, $options: 'i' };
         if (from || to) {
             filter.collectedDate = {};
-            if (from) filter.collectedDate.$gte = new Date(from);
-            if (to) filter.collectedDate.$lte = new Date(to);
+            if (from) {
+                if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+                    const [y, m, d] = from.split('-').map(Number);
+                    filter.collectedDate.$gte = new Date(y, m - 1, d, 0, 0, 0, 0);
+                } else {
+                    filter.collectedDate.$gte = new Date(from);
+                }
+            }
+            if (to) {
+                if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+                    const [y, m, d] = to.split('-').map(Number);
+                    filter.collectedDate.$lte = new Date(y, m - 1, d, 23, 59, 59, 999);
+                } else {
+                    filter.collectedDate.$lte = new Date(to);
+                }
+            }
         }
 
         const [total, collectedCash] = await Promise.all([
@@ -104,7 +126,18 @@ exports.updateCollectedCash = async (req, res, next) => {
             allowOwner: true,
         });
 
-        const update = { name, amount, user: userId };
+        const update = { user: userId };
+        if (name !== undefined) update.name = name;
+        if (amount !== undefined) {
+            const numericAmount = Number(amount);
+            if (!(numericAmount > 0)) {
+                return res.status(400).json({
+                    success: false,
+                    error: { code: 'BAD_REQUEST', message: 'Amount must be greater than 0.' },
+                });
+            }
+            update.amount = numericAmount;
+        }
         if (paymentMethod !== undefined) {
             const method = String(paymentMethod).toLowerCase();
             if (!['cash', 'upi'].includes(method)) {
